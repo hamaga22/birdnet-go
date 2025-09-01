@@ -3,7 +3,6 @@ module github.com/tphakala/birdnet-go
 go 1.24.6
 
 require (
-	cgt.name/pkg/go-mwclient v1.3.0
 	github.com/antonholmquist/jason v1.0.0
 	github.com/eclipse/paho.mqtt.golang v1.5.0
 	github.com/fatih/color v1.18.0
@@ -11,7 +10,7 @@ require (
 	github.com/getsentry/sentry-go/echo v0.35.1
 	github.com/go-audio/audio v1.0.0
 	github.com/go-audio/wav v1.1.0
-	github.com/go-echarts/go-echarts/v2 v2.5.2
+	github.com/go-echarts/go-echarts/v2 v2.6.1
 	github.com/google/uuid v1.6.0
 	github.com/jlaffaye/ftp v0.2.0
 	github.com/k3a/html2text v1.2.1
@@ -96,7 +95,6 @@ require (
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/mattn/go-pointer v0.0.1 // indirect
 	github.com/mattn/go-sqlite3 v1.14.32
-	github.com/mrjones/oauth v0.0.0-20190623134757-126b35219450 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/pelletier/go-toml/v2 v2.2.3 // indirect
 	github.com/power-devops/perfstat v0.0.0-20210106213030-5aafc221ea8c // indirect
