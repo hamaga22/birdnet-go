@@ -4,7 +4,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Container]
-Image=ghcr.io/tphakala/birdnet-go:nightly
+Image=ghcr.io/hamaga22/birdnet-go:nightly
 ContainerName=birdnet-go
 Volume=./config:/config
 Volume=./data:/data

@@ -52,7 +52,7 @@ trap cleanup_temp_files EXIT INT TERM
 validate_version_history_entry() {
     local line="$1"
     # Format: timestamp|image_hash|config_backup|image_tag|context
-    # Example: 20240826-134817|sha256:abc123...|config-backup-20240826-134817.yaml|ghcr.io/tphakala/birdnet-go:podman-nightly|pre-update
+    # Example: 20240826-134817|sha256:abc123...|config-backup-20240826-134817.yaml|ghcr.io/hamaga22/birdnet-go:podman-nightly|pre-update
     if [[ "$line" =~ ^[0-9]{8}-[0-9]{6}\|[^|]+\|[^|]*\|[^|]+\|[^|]+$ ]]; then
         return 0
     else
@@ -926,7 +926,7 @@ parse_arguments() {
     fi
     
     # Set the container image URL after parsing arguments
-    BIRDNET_GO_IMAGE="ghcr.io/tphakala/birdnet-go:${BIRDNET_GO_VERSION}"
+    BIRDNET_GO_IMAGE="ghcr.io/hamaga22/birdnet-go:${BIRDNET_GO_VERSION}"
     
     # Log the version being used
     echo "📦 Using BirdNET-Go Podman version: $BIRDNET_GO_VERSION"
@@ -1765,7 +1765,7 @@ EOF
         cp "$quadlet_source" "$quadlet_target"
         
         # Update image reference
-        sed -i "s|ghcr.io/tphakala/birdnet-go:nightly|${BIRDNET_GO_IMAGE}|g" "$quadlet_target"
+        sed -i "s|ghcr.io/hamaga22/birdnet-go:nightly|${BIRDNET_GO_IMAGE}|g" "$quadlet_target"
         
         # Update timezone if configured
         if [ -n "$CONFIGURED_TZ" ]; then

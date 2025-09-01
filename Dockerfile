@@ -151,8 +151,8 @@ LABEL podman.userns="keep-id"
 LABEL podman.network.bridge="true"
 
 # Usage information for different runtimes
-LABEL usage.docker="docker run -d --name birdnet-go -p 8080:8080 -v ./config:/config -v ./data:/data --device /dev/snd:/dev/snd ghcr.io/tphakala/birdnet-go:latest"
-LABEL usage.podman="podman run -d --name birdnet-go -p 8080:8080 -v ./config:/config -v ./data:/data --device /dev/snd:/dev/snd ghcr.io/tphakala/birdnet-go:podman-latest"
+LABEL usage.docker="docker run -d --name birdnet-go -p 8080:8080 -v ./config:/config -v ./data:/data --device /dev/snd:/dev/snd ghcr.io/hamaga22/birdnet-go:latest"
+LABEL usage.podman="podman run -d --name birdnet-go -p 8080:8080 -v ./config:/config -v ./data:/data --device /dev/snd:/dev/snd ghcr.io/hamaga22/birdnet-go:podman-latest"
 LABEL usage.compose.docker="Use Docker/docker-compose.yml"
 LABEL usage.compose.podman="Use Podman/podman-compose.yml"
 
