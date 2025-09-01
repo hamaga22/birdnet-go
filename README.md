@@ -1,4 +1,9 @@
 # BirdNET-Mark
+
+<p align="center">
+  <img src="assets/images/mark.png" />
+</p>
+
 This is hamaga22's fork of BirdNET-Go. The vast majority of things are unchanged, though I am changing the logos to one I made of a Great Blue Heron wearing headphones. The GBH's name is Mark, he(she?) lives year round by some lakes in my town. The movitvation behind this fork is to add a little bit of personalization to the feel of the website. I hope to change/add to the analytics displays some as well.
 
 # BirdNET-Go
