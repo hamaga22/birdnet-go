@@ -1,7 +1,8 @@
 ARG TFLITE_LIB_DIR=/usr/lib
 ARG TENSORFLOW_VERSION=2.17.1
 
-FROM --platform=$BUILDPLATFORM golang:1.24.6-bookworm AS buildenv
+#FROM --platform=$BUILDPLATFORM golang:1.24.6-bookworm AS buildenv
+FROM docker.io/library/golang:1.24.6-bookworm AS buildenv
 
 # Pass BUILD_VERSION through to the build stage
 ARG BUILD_VERSION
@@ -151,8 +152,8 @@ LABEL podman.userns="keep-id"
 LABEL podman.network.bridge="true"
 
 # Usage information for different runtimes
-LABEL usage.docker="docker run -d --name birdnet-go -p 8080:8080 -v ./config:/config -v ./data:/data --device /dev/snd:/dev/snd ghcr.io/tphakala/birdnet-go:latest"
-LABEL usage.podman="podman run -d --name birdnet-go -p 8080:8080 -v ./config:/config -v ./data:/data --device /dev/snd:/dev/snd ghcr.io/tphakala/birdnet-go:podman-latest"
+LABEL usage.docker="docker run -d --name birdnet-go -p 8080:8080 -v ./config:/config -v ./data:/data --device /dev/snd:/dev/snd ghcr.io/hamaga22/birdnet-go:latest"
+LABEL usage.podman="podman run -d --name birdnet-go -p 8080:8080 -v ./config:/config -v ./data:/data --device /dev/snd:/dev/snd ghcr.io/hamaga22/birdnet-go:podman-latest"
 LABEL usage.compose.docker="Use Docker/docker-compose.yml"
 LABEL usage.compose.podman="Use Podman/podman-compose.yml"
 
