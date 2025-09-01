@@ -50,7 +50,7 @@
         class="w-36 h-36 rounded-full bg-gradient-to-b from-base-200 to-base-100 flex items-center justify-center p-1 ring-1 ring-base-content/10"
       >
         <img
-          src="/assets/images/mark.png"
+          src="/assets/images/mark-circle.png"
           alt={t('about.logoAlt')}
           class="w-full h-full object-contain rounded-full"
           style:transform="scale(1)"
@@ -62,6 +62,18 @@
           {t('about.subtitle')}
         </p>
       </div>
+    </div>
+  </div>
+
+  <!-- Sam's Section -->
+  <div class="collapse bg-base-100 shadow-sm">
+    <input type="checkbox" checked />
+    <div class="collapse-title text-xl font-medium">Sam's Version</div>
+    <div class="collapse-content prose max-w-none">
+      <p>
+        This is Sam's version of BirdNET-Go. I created this fork because I wanted to change the
+        logos and to attempt some of my own data visualizations.
+      </p>
     </div>
   </div>
 
