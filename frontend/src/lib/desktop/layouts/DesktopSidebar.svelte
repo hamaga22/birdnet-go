@@ -2,7 +2,7 @@
   import { auth as authStore } from '$lib/stores/auth';
   import { cn } from '$lib/utils/cn';
   import { systemIcons } from '$lib/utils/icons';
-  // Centralized icons - see icons.ts
+// Centralized icons - see icons.ts
   import { t } from '$lib/i18n';
   import LoginModal from '../components/modals/LoginModal.svelte';
 
@@ -125,7 +125,7 @@
       >
         BirdNET-Go
         <img
-          src="/assets/images/mark.png"
+          src="/assets/images/mark-circle.png"
           alt="BirdNET-Go Logo"
           class="absolute h-10 w-10 right-5 mr-2"
         />

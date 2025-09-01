@@ -50,7 +50,7 @@
         class="w-36 h-36 rounded-full bg-gradient-to-b from-base-200 to-base-100 flex items-center justify-center p-1 ring-1 ring-base-content/10"
       >
         <img
-          src="/assets/images/mark.png"
+          src="/assets/images/mark-circle.png"
           alt={t('about.logoAlt')}
           class="w-full h-full object-contain rounded-full"
           style:transform="scale(1)"
