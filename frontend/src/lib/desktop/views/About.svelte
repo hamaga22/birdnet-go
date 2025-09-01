@@ -57,9 +57,10 @@
         />
       </div>
       <div class="mt-4">
-        <h1 class="text-4xl font-bold">{t('about.title')}</h1>
+        <h1 class="text-4xl font-bold">BirdNET-Mark</h1>
         <p class="text-base-content/70 text-lg mt-2">
-          {t('about.subtitle')}
+          A fork of BirdNET-Go, modern interface for real-time bird sound detection and
+          classification
         </p>
       </div>
     </div>
@@ -68,11 +69,12 @@
   <!-- Sam's Section -->
   <div class="collapse bg-base-100 shadow-sm">
     <input type="checkbox" checked />
-    <div class="collapse-title text-xl font-medium">Sam's Version</div>
+    <div class="collapse-title text-xl font-medium">Sam's Version: BirdNET-Mark</div>
     <div class="collapse-content prose max-w-none">
       <p>
-        This is Sam's version of BirdNET-Go. I created this fork because I wanted to change the
-        logos and to attempt some of my own data visualizations.
+        This is Sam's version of BirdNET-Go, nicknamed BirdNET-Mark after Mark the Great Blue Heron. I created this fork because I
+        wanted to change the logos and to attempt some of my own data
+        visualizations.
       </p>
     </div>
   </div>
