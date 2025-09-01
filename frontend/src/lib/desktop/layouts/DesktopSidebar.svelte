@@ -121,12 +121,12 @@
       <button
         onclick={() => navigate(navigationUrls.dashboard)}
         class="flex items-center gap-2 font-black text-2xl"
-        aria-label="BirdNET-Go Home"
+        aria-label="BirdNET-Mark Home"
       >
-        BirdNET-Go
+        BirdNET-Mark
         <img
           src="/assets/images/mark-circle.png"
-          alt="BirdNET-Go Logo"
+          alt="BirdNET-Mark Logo"
           class="absolute h-10 w-10 right-5 mr-2"
         />
       </button>
