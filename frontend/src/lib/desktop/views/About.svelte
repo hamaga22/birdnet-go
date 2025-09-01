@@ -65,6 +65,18 @@
     </div>
   </div>
 
+  <!-- Sam's Section -->
+  <div class="collapse bg-base-100 shadow-sm">
+    <input type="checkbox" checked />
+    <div class="collapse-title text-xl font-medium">Sam's Version</div>
+    <div class="collapse-content prose max-w-none">
+      <p>
+        This is Sam's version of BirdNET-Go. I created this fork because I wanted to change the
+        logos and to attempt some of my own data visualizations.
+      </p>
+    </div>
+  </div>
+
   <!-- About BirdNET-Go Section -->
   <Card title={t('about.overview')} className="bg-base-100 shadow-sm">
     <p>
