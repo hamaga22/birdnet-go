@@ -1,7 +1,8 @@
 ARG TFLITE_LIB_DIR=/usr/lib
 ARG TENSORFLOW_VERSION=2.17.1
 
-FROM --platform=$BUILDPLATFORM golang:1.25.1-bookworm AS buildenv
+# FROM --platform=$BUILDPLATFORM golang:1.25.1-bookworm AS buildenv
+FROM docker.io/library/golang:1.25.1-bookwork AS buildenv
 
 # Pass BUILD_VERSION through to the build stage
 ARG BUILD_VERSION
