@@ -1,8 +1,8 @@
 ARG TFLITE_LIB_DIR=/usr/lib
 ARG TENSORFLOW_VERSION=2.17.1
 
-# FROM --platform=$BUILDPLATFORM golang:1.25.1-bookworm AS buildenv
-FROM docker.io/library/golang:1.25.1-bookwork AS buildenv
+FROM --platform=$BUILDPLATFORM golang:1.25.1-bookworm AS buildenv
+# FROM docker.io/library/golang:1.25.1-bookworm AS buildenv
 
 # Pass BUILD_VERSION through to the build stage
 ARG BUILD_VERSION
@@ -24,6 +24,11 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
 
 # Install Task
 RUN sh -c "$(curl --location https://taskfile.dev/install.sh)" -- -d -b /usr/local/bin
+
+# Install XNNPACK?
+RUN apt-get update -q && apt-get install -q -y \
+    libxnnpack-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 # Create dev-user for building and devcontainer usage
 RUN groupadd --gid 10001 dev-user && \
