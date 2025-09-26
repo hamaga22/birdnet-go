@@ -98,7 +98,8 @@
       "editSpecies": "Modifier l'espèce",
       "removeSpecies": "Supprimer l'espèce",
       "dismissError": "Ignorer l'erreur",
-      "downloadCsv": "Télécharger la liste des espèces au format CSV"
+      "downloadCsv": "Télécharger la liste des espèces au format CSV",
+      "calendarNavigation": "Navigation du calendrier : utilisez les flèches pour vous déplacer, Entrée pour sélectionner, Échap pour fermer"
     },
     "modal": {
       "confirmAction": "Confirmer l'action",
@@ -1495,6 +1496,7 @@
       }
     },
     "datePicker": {
+      "today": "Aujourd'hui",
       "feedback": {
         "endDateCleared": "Date de fin effacée pour maintenir une plage valide",
         "startDateCleared": "Date de début effacée pour maintenir une plage valide",

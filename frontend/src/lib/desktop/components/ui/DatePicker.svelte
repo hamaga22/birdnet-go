@@ -1,15 +1,61 @@
+<!--
+DatePicker.svelte - Calendar date selection component
+
+Purpose:
+- Provides an accessible date selection interface with calendar dropdown
+- Supports date validation, keyboard navigation, and range constraints
+- Includes special "Today" button with optional custom behavior
+
+Features:
+- Full keyboard navigation (arrow keys, PageUp/Down, Home/End)
+- Screen reader support with ARIA attributes and live regions
+- Date range validation (min/max date constraints)
+- Visual indicators for today's date and selected date
+- Custom handler support for "Today" button click
+- Responsive button sizing (xs, sm, md, lg)
+- Automatic focus management
+- Click-outside-to-close behavior
+
+Props:
+- value: string - Selected date in YYYY-MM-DD format
+- onChange: (date: string) => void - Callback when date is selected
+- onTodayClick?: () => void - Optional custom handler for Today button (e.g., to reset date persistence)
+- maxDate?: string - Maximum selectable date (defaults to today)
+- minDate?: string - Minimum selectable date
+- className?: string - Additional CSS classes
+- disabled?: boolean - Disable the date picker
+- placeholder?: string - Placeholder text when no date selected
+- size?: ButtonSize - Button size variant ('xs' | 'sm' | 'md' | 'lg')
+
+Keyboard Navigation:
+- Enter/Space: Open calendar (when button focused)
+- Escape: Close calendar
+- Arrow keys: Navigate days (left/right = ±1 day, up/down = ±7 days)
+- PageUp/PageDown: Previous/next month
+- Shift+PageUp/PageDown: Previous/next year
+- Home/End: First/last day of month
+- Enter/Space: Select focused date
+
+Accessibility:
+- ARIA labels for all interactive elements
+- Live region announcements for navigation
+- Keyboard instructions for screen readers
+- Focus management and visual indicators
+-->
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { cn } from '$lib/utils/cn';
-  import { navigationIcons, systemIcons } from '$lib/utils/icons'; // Centralized icons - see icons.ts
-  import { getLocalDateString } from '$lib/utils/date';
+  import { cn } from '$lib/utils/cn.js';
+  import { navigationIcons, systemIcons } from '$lib/utils/icons.js'; // Centralized icons
+  import { getLocalDateString } from '$lib/utils/date.js';
   import { t } from '$lib/i18n';
+  import type { HTMLAttributes } from 'svelte/elements';
 
   type ButtonSize = 'xs' | 'sm' | 'md' | 'lg';
 
-  interface Props {
+  interface Props extends HTMLAttributes<HTMLButtonElement> {
     value: string; // YYYY-MM-DD format
     onChange: (_date: string) => void;
+    onTodayClick?: () => void; // Optional custom handler for Today button
     maxDate?: string;
     minDate?: string;
     className?: string;
@@ -21,12 +67,14 @@
   let {
     value,
     onChange,
+    onTodayClick,
     maxDate = getLocalDateString(new Date()),
     minDate,
     className = '',
     disabled = false,
-    placeholder = 'Select date',
+    placeholder = t('forms.placeholders.date'),
     size = 'sm',
+    ...restProps
   }: Props = $props();
 
   // Date validation functions
@@ -97,7 +145,7 @@
     try {
       const date = selectedDate();
       if (!date) return placeholder;
-      return date.toLocaleDateString('en-US', {
+      return date.toLocaleDateString(undefined, {
         weekday: 'short',
         year: 'numeric',
         month: 'short',
@@ -110,7 +158,7 @@
 
   // Get month name for calendar header
   const monthYearText = $derived(
-    displayMonth.toLocaleDateString('en-US', {
+    displayMonth.toLocaleDateString(undefined, {
       month: 'long',
       year: 'numeric',
     })
@@ -170,7 +218,7 @@
   function goToPreviousMonth() {
     displayMonth = new Date(displayMonth.getFullYear(), displayMonth.getMonth() - 1, 1);
     ariaMessage = t('components.datePicker.aria.monthChanged', {
-      month: displayMonth.toLocaleDateString('en-US', { month: 'long' }),
+      month: displayMonth.toLocaleDateString(undefined, { month: 'long' }),
       year: displayMonth.getFullYear(),
     });
   }
@@ -178,7 +226,7 @@
   function goToNextMonth() {
     displayMonth = new Date(displayMonth.getFullYear(), displayMonth.getMonth() + 1, 1);
     ariaMessage = t('components.datePicker.aria.monthChanged', {
-      month: displayMonth.toLocaleDateString('en-US', { month: 'long' }),
+      month: displayMonth.toLocaleDateString(undefined, { month: 'long' }),
       year: displayMonth.getFullYear(),
     });
   }
@@ -190,12 +238,20 @@
     const dateStr = getLocalDateString(date);
     onChange(dateStr);
     showCalendar = false;
+    buttonRef?.focus();
   }
 
   // Toggle calendar
   function toggleCalendar() {
     if (disabled) return;
-    showCalendar = !showCalendar;
+    const opening = !showCalendar;
+    showCalendar = opening;
+    ariaMessage = opening
+      ? t('components.datePicker.aria.calendarOpened')
+      : t('components.datePicker.aria.calendarClosed');
+    if (opening) {
+      focusedDate = selectedDate() || new Date();
+    }
   }
 
   // Enhanced keyboard navigation
@@ -258,7 +314,7 @@
           // Shift + PageUp = Previous year
           displayMonth = new Date(displayMonth.getFullYear() - 1, displayMonth.getMonth(), 1);
           ariaMessage = t('components.datePicker.aria.monthChanged', {
-            month: displayMonth.toLocaleDateString('en-US', { month: 'long' }),
+            month: displayMonth.toLocaleDateString(undefined, { month: 'long' }),
             year: displayMonth.getFullYear(),
           });
         } else {
@@ -273,7 +329,7 @@
           // Shift + PageDown = Next year
           displayMonth = new Date(displayMonth.getFullYear() + 1, displayMonth.getMonth(), 1);
           ariaMessage = t('components.datePicker.aria.monthChanged', {
-            month: displayMonth.toLocaleDateString('en-US', { month: 'long' }),
+            month: displayMonth.toLocaleDateString(undefined, { month: 'long' }),
             year: displayMonth.getFullYear(),
           });
         } else {
@@ -313,7 +369,7 @@
       ) {
         displayMonth = new Date(newFocus.getFullYear(), newFocus.getMonth(), 1);
         ariaMessage = t('components.datePicker.aria.monthChanged', {
-          month: displayMonth.toLocaleDateString('en-US', { month: 'long' }),
+          month: displayMonth.toLocaleDateString(undefined, { month: 'long' }),
           year: displayMonth.getFullYear(),
         });
       }
@@ -329,6 +385,8 @@
     const target = event.target as Node;
     if (!calendarRef?.contains(target) && !buttonRef?.contains(target)) {
       showCalendar = false;
+      ariaMessage = t('components.datePicker.aria.calendarClosed');
+      buttonRef?.focus();
     }
   }
 
@@ -340,8 +398,10 @@
     };
   });
 
-  // Week day headers
-  const weekDays = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  // Week day headers (localized)
+  const weekDays = Array.from({ length: 7 }, (_, i) =>
+    new Date(1970, 0, 4 + i).toLocaleDateString(undefined, { weekday: 'short' })
+  );
 
   // Map size prop to CSS class
   const sizeClass = $derived(() => {
@@ -360,11 +420,12 @@
   });
 </script>
 
-<div class="relative datepicker-wrapper">
+<div class={cn('relative datepicker-wrapper', className)}>
   <!-- Date Input Button -->
   <button
     bind:this={buttonRef}
     type="button"
+    {...restProps}
     class={cn(
       'btn',
       sizeClass(),
@@ -372,13 +433,12 @@
       'font-normal',
       'min-w-[11rem]', // Consistent width to prevent layout shifts
       'justify-start', // Left-align content within button
-      disabled ? 'btn-disabled' : '',
-      className
+      disabled ? 'btn-disabled' : ''
     )}
     onclick={toggleCalendar}
     onkeydown={handleKeyDown}
     {disabled}
-    aria-label="Select date"
+    aria-label={t('common.aria.selectDate')}
     aria-expanded={showCalendar}
     aria-haspopup="true"
   >
@@ -418,7 +478,7 @@
       bind:this={calendarRef}
       class="absolute z-50 mt-1 bg-base-100 border border-base-300 rounded-lg shadow-lg p-4 min-w-[280px]"
       role="dialog"
-      aria-label="Date picker calendar"
+      aria-label={t('common.aria.datePickerCalendar')}
     >
       <!-- Month Navigation -->
       <div class="flex items-center justify-between mb-4">
@@ -426,7 +486,7 @@
           type="button"
           class="btn btn-ghost btn-sm btn-circle"
           onclick={goToPreviousMonth}
-          aria-label="Previous month"
+          aria-label={t('common.aria.previousMonth')}
         >
           {@html navigationIcons.arrowLeft}
         </button>
@@ -439,7 +499,7 @@
           type="button"
           class="btn btn-ghost btn-sm btn-circle"
           onclick={goToNextMonth}
-          aria-label="Next month"
+          aria-label={t('common.aria.nextMonth')}
         >
           {@html navigationIcons.arrowRight}
         </button>
@@ -461,7 +521,7 @@
         aria-labelledby="month-year-heading"
         aria-describedby="calendar-instructions"
       >
-        {#each calendarDays() as date}
+        {#each calendarDays() as date, i (date ? date.getTime() : `empty-${i}`)}
           {#if date}
             <button
               type="button"
@@ -488,18 +548,20 @@
               onclick={() => selectDate(date)}
               onkeydown={handleKeyDown}
               disabled={!isDateSelectable(date)}
-              aria-label={cn(
+              aria-label={[
                 date.toLocaleDateString(),
                 isDateSelected(date)
                   ? t('components.datePicker.aria.dateSelected', {
                       date: date.toLocaleDateString(),
                     })
                   : '',
-                isToday(date) ? 'Today' : '',
+                isToday(date) ? t('components.datePicker.today') : '',
                 !isDateSelectable(date)
                   ? t('components.datePicker.aria.dayUnavailable', { day: date.getDate() })
-                  : ''
-              )}
+                  : '',
+              ]
+                .filter(Boolean)
+                .join(' ')}
               aria-selected={isDateSelected(date)}
               aria-current={isToday(date) ? 'date' : undefined}
             >
@@ -521,10 +583,23 @@
         <button
           type="button"
           class="btn btn-primary btn-sm btn-block"
-          onclick={() => selectDate(new Date())}
+          onclick={() => {
+            if (onTodayClick) {
+              // Use custom handler if provided
+              onTodayClick();
+              showCalendar = false;
+              buttonRef?.focus();
+            } else {
+              // Default behavior: just select today's date
+              selectDate(new Date());
+            }
+          }}
           disabled={!isDateSelectable(new Date())}
+          aria-label={t('components.datePicker.aria.todayButton', {
+            today: new Date().toLocaleDateString(),
+          })}
         >
-          Today
+          {t('components.datePicker.today')}
         </button>
       </div>
     </div>

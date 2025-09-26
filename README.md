@@ -43,6 +43,9 @@ This is hamaga22's fork of BirdNET-Go. The vast majority of things are unchanged
   <a href="https://github.com/tphakala/birdnet-go/issues">
     <img src="https://img.shields.io/github/issues/tphakala/birdnet-go?style=flat-square&color=red">
   </a>
+  <a href="https://discord.gg/gcSCFGUtsd">
+    <img src="https://img.shields.io/discord/1298738918239100939?style=flat-square&logo=discord&color=5865F2&label=Discord">
+  </a>
 
   <a href="https://coderabbit.ai">
     <img src="https://img.shields.io/coderabbit/prs/github/tphakala/birdnet-go?utm_source=oss&utm_medium=github&utm_campaign=tphakala%2Fbirdnet-go&labelColor=171717&color=FF570A&link=https%3A%2F%2Fcoderabbit.ai&label=CodeRabbit+Reviews">
@@ -79,40 +82,30 @@ bash ./install.sh
 
 For detailed installation instructions, see the [installation documentation](doc/wiki/installation.md). For securing your BirdNET-Go installation, see the [security documentation](doc/wiki/security.md). See [recommended hardware](doc/wiki/hardware.md) for optimal performance.
 
-## Building
 
-For instructions on how to build the project, see the [building documentation](doc/wiki/building.md).
 
-## Usage
-
-```bash
-BirdNET-Go CLI
-
-Usage:
-  birdnet-go [command]
-
-Available Commands:
-  authors     Print the list of authors
-  benchmark   Run performance benchmark
-  directory   Analyze all *.wav files in a directory
-  file        Analyze an audio file
-  help        Help about any command
-  license     Print the license of Go-BirdNET
-  rangefilter Manage the range filter database
-  realtime    Analyze audio in realtime mode
-  support     Generate a support bundle
-
-Flags:
-      --debug               Enable debug output
-  -h, --help                help for birdnet
-      --locale string       Set the locale for labels. Accepts full name or 2-letter code. (default "finnish")
-      --overlap float       Overlap value between 0.0 and 2.9 (High values like 2.7 enable Deep Detection)
-      --sensitivity float   Sigmoid sensitivity value between 0.0 and 1.5 (default 1)
-      --threshold float     Confidency threshold for detections, value between 0.1 to 1.0 (default 0.8)
-
-Use "birdnet [command] --help" for more information about a command.
 
 There is more detailed usage documentation at [Wiki](doc/wiki/guide.md)
+
+## Community
+
+Join our [Discord server](https://discord.gg/gcSCFGUtsd) for support, discussions, and updates about BirdNET-Go!
+
+## Related Projects
+
+### Core & Extensions
+- [BirdNET-Analyzer](https://github.com/birdnet-team/BirdNET-Analyzer) - Upstream project providing the BirdNET AI model for bird sound identification
+- [BirdNET-Go Classifiers](https://github.com/tphakala/birdnet-go-classifiers) - Enhanced BirdNET classifiers including additional species
+
+### System Integration
+- [Cockpit BirdNET-Go](https://github.com/tphakala/cockpit-birdnet-go) - Web-based system management plugin for BirdNET-Go using Cockpit framework
+
+### Migration Tools
+- [BirdNET-Pi2Go](https://github.com/tphakala/birdnet-pi2go) - Database conversion tool for migrating from BirdNET-Pi to BirdNET-Go
+
+### Hardware Solutions
+- [BirdNET-Go ESP32 RTSP Microphone](https://github.com/Sukecz/birdnetgo-esp32-rtsp-mic) - ESP32-based RTSP streaming microphone for remote audio capture
+- [ESP32 Audio Streamer](https://github.com/jpmurray/esp32-audio-streamer) - Alternative ESP32 RTSP streaming solution for BirdNET-Go audio input
 
 ## License
 
@@ -129,4 +122,3 @@ Please let me know if you are missing from contributors list!
 BirdNET AI model by the K. Lisa Yang Center for Conservation Bioacoustics at the Cornell Lab of Ornithology in collaboration with Chemnitz University of Technology. Stefan Kahl, Connor Wood, Maximilian Eibl, Holger Klinck.
 
 BirdNET label translations by Patrick Levin for BirdNET-Pi project by Patrick McGuire.
-```

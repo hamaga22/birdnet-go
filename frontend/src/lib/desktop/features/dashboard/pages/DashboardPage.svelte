@@ -1,3 +1,42 @@
+<!--
+DashboardPage.svelte - Main dashboard page with bird detection summaries
+
+Purpose:
+- Central dashboard displaying daily species summaries and recent detections
+- Manages date persistence with hybrid URL/localStorage approach
+- Provides real-time updates via Server-Sent Events (SSE)
+- Handles date navigation with smart sticky date selection
+
+Features:
+- Sticky date selection (30-minute retention in localStorage)
+- URL-based date sharing for bookmarking/sharing specific dates
+- Real-time detection updates via SSE with animations
+- Adjacent date preloading for smooth navigation
+- Browser back/forward button support
+- "Today" button resets date persistence to current date
+- Dashboard navigation from sidebar resets to current date
+
+Date Persistence Strategy:
+- Priority: URL parameter > Recent localStorage (within 30 min) > Current date
+- URL parameter allows direct navigation and sharing
+- localStorage provides sticky behavior for return visits
+- Automatic cleanup after 30-minute retention period
+- Reset mechanisms via "Today" button and dashboard navigation
+
+Props: None (Page component)
+
+State Management:
+- selectedDate: Currently viewed date (YYYY-MM-DD format)
+- dailySummary: Array of species detection summaries for the selected date
+- recentDetections: Array of recent individual detections
+- Real-time updates tracked via newDetectionIds and hourlyUpdates
+
+Performance Optimizations:
+- Adjacent date preloading for instant navigation
+- Debounced SSE updates to prevent excessive re-renders
+- Efficient animation cleanup with requestAnimationFrame
+- Map-based lookups for O(1) species updates
+-->
 <script lang="ts">
   import { onMount, untrack } from 'svelte';
   import ReconnectingEventSource from 'reconnecting-eventsource';
@@ -11,8 +50,14 @@
     parseHour,
     parseLocalDateString,
   } from '$lib/utils/date';
+  import {
+    getInitialDate,
+    persistDate,
+    getDateFromURL,
+    resetDateToToday,
+  } from '$lib/utils/datePersistence';
   import { getLogger } from '$lib/utils/logger';
-  import { safeArrayAccess } from '$lib/utils/security';
+  import { safeArrayAccess, isPlainObject } from '$lib/utils/security';
 
   const logger = getLogger('app');
 
@@ -20,15 +65,54 @@
   const ANIMATION_CLEANUP_DELAY = 2200; // Slightly longer than 2s animation duration
   const MIN_FETCH_LIMIT = 10; // Minimum number of detections to fetch for SSE processing
 
+  // SSE Detection Data Type
+  type SSEDetectionData = {
+    ID: number;
+    CommonName: string;
+    ScientificName: string;
+    Confidence: number;
+    Date: string; // YYYY-MM-DD
+    Time: string; // HH:MM:SS
+    SpeciesCode: string;
+    Verified?: Detection['verified'];
+    Locked?: boolean;
+    Source?: string;
+    BeginTime?: string;
+    EndTime?: string;
+    eventType?: string;
+  };
+
+  function isSSEDetectionData(v: unknown): v is SSEDetectionData {
+    if (!isPlainObject(v)) return false;
+    const o = v as Record<string, unknown>;
+    const dateOk = typeof o.Date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(o.Date);
+    const timeOk = typeof o.Time === 'string' && /^\d{2}:\d{2}:\d{2}$/.test(o.Time);
+    return (
+      typeof o.ID === 'number' &&
+      typeof o.CommonName === 'string' &&
+      o.CommonName.length > 0 &&
+      typeof o.ScientificName === 'string' &&
+      o.ScientificName.length > 0 &&
+      typeof o.Confidence === 'number' &&
+      dateOk &&
+      timeOk &&
+      typeof o.SpeciesCode === 'string' &&
+      o.SpeciesCode.length > 0
+    );
+  }
+
   // State management
   let dailySummary = $state<DailySpeciesSummary[]>([]);
   let recentDetections = $state<Detection[]>([]);
-  let selectedDate = $state(getLocalDateString());
+  let selectedDate = $state(getInitialDate());
   let isLoadingSummary = $state(true);
   let isLoadingDetections = $state(true);
   let summaryError = $state<string | null>(null);
   let detectionsError = $state<string | null>(null);
   let showThumbnails = $state(true); // Default to true for backward compatibility
+
+  // SSE throttling timer
+  let sseFetchTimer: ReturnType<typeof setTimeout> | null = null;
 
   // Function to get initial detection limit from localStorage
   function getInitialDetectionLimit(): number {
@@ -428,22 +512,30 @@
   }
 
   // Helper function to process SSE detection data
-  function handleSSEDetection(detectionData: any) {
+  function handleSSEDetection(detectionData: unknown) {
+    if (!isSSEDetectionData(detectionData)) {
+      const keys =
+        typeof detectionData === 'object' && detectionData !== null
+          ? Object.keys(detectionData as Record<string, unknown>)
+          : [];
+      logger.warn('SSE detection payload missing required fields', { keys });
+      return;
+    }
     try {
       // Convert SSEDetectionData to Detection format
       const detection: Detection = {
-        id: detectionData.ID as number,
-        commonName: detectionData.CommonName as string,
-        scientificName: detectionData.ScientificName as string,
-        confidence: detectionData.Confidence as number,
-        date: detectionData.Date as string,
-        time: detectionData.Time as string,
-        speciesCode: detectionData.SpeciesCode as string,
-        verified: (detectionData.Verified || 'unverified') as Detection['verified'],
-        locked: (detectionData.Locked || false) as boolean,
-        source: (detectionData.Source || '') as string,
-        beginTime: (detectionData.BeginTime || '') as string,
-        endTime: (detectionData.EndTime || '') as string,
+        id: detectionData.ID,
+        commonName: detectionData.CommonName,
+        scientificName: detectionData.ScientificName,
+        confidence: detectionData.Confidence,
+        date: detectionData.Date,
+        time: detectionData.Time,
+        speciesCode: detectionData.SpeciesCode,
+        verified: detectionData.Verified ?? 'unverified',
+        locked: detectionData.Locked ?? false,
+        source: detectionData.Source ?? '',
+        beginTime: detectionData.BeginTime ?? '',
+        endTime: detectionData.EndTime ?? '',
       };
 
       handleNewDetection(detection);
@@ -453,6 +545,11 @@
   }
 
   onMount(() => {
+    // Persist the initial date to URL only if out of sync
+    if (getDateFromURL() !== selectedDate) {
+      persistDate(selectedDate);
+    }
+
     fetchDailySummary();
     fetchRecentDetections();
     fetchDashboardConfig();
@@ -463,7 +560,30 @@
     // Initial preload of adjacent dates (reactive effect will handle subsequent preloads)
     triggerAdjacentPreload(selectedDate);
 
+    // Handle browser navigation (back/forward)
+    const handlePopState = () => {
+      const urlDate = getDateFromURL();
+      if (urlDate && urlDate !== selectedDate) {
+        selectedDate = urlDate;
+        handleDateChangeWithCleanup();
+        fetchDailySummary();
+      } else if (!urlDate) {
+        // If no date in URL, use current date
+        const currentDate = getLocalDateString();
+        if (currentDate !== selectedDate) {
+          selectedDate = currentDate;
+          handleDateChangeWithCleanup();
+          fetchDailySummary();
+        }
+      }
+    };
+
+    window.addEventListener('popstate', handlePopState);
+
     return () => {
+      // Clean up browser navigation listener
+      window.removeEventListener('popstate', handlePopState);
+
       // Clean up SSE connection
       if (eventSource) {
         eventSource.close();
@@ -473,6 +593,12 @@
       // Clean up debounce timer
       if (updateTimer) {
         clearTimeout(updateTimer);
+      }
+
+      // Clean up SSE fetch throttling timer
+      if (sseFetchTimer) {
+        clearTimeout(sseFetchTimer);
+        sseFetchTimer = null;
       }
 
       // Clean up preload debounce timer
@@ -520,7 +646,9 @@
     const date = parseLocalDateString(selectedDate);
     if (!date) return;
     date.setDate(date.getDate() - 1);
-    selectedDate = getLocalDateString(date);
+    const newDateString = getLocalDateString(date);
+    selectedDate = newDateString;
+    persistDate(newDateString);
     handleDateChangeWithCleanup();
     fetchDailySummary();
   }
@@ -532,13 +660,33 @@
     const newDateString = getLocalDateString(date);
     if (!isFutureDate(newDateString)) {
       selectedDate = newDateString;
+      persistDate(newDateString);
       handleDateChangeWithCleanup();
       fetchDailySummary();
     }
   }
 
+  /**
+   * Handle date change from DatePicker component
+   * Persists the new date to both URL and localStorage for sticky behavior
+   */
   function handleDateChange(date: string) {
     selectedDate = date;
+    persistDate(date);
+    handleDateChangeWithCleanup();
+    fetchDailySummary();
+  }
+
+  /**
+   * Navigate to today's date and reset date persistence
+   * Called when user clicks "Today" button in DatePicker
+   * Clears both URL parameter and localStorage to show current date
+   */
+  function goToToday() {
+    // Reset date persistence and navigate to today
+    resetDateToToday();
+    const currentDate = getLocalDateString();
+    selectedDate = currentDate;
     handleDateChangeWithCleanup();
     fetchDailySummary();
   }
@@ -822,8 +970,7 @@
 
     // Start batch preloading using untrack to prevent reactive dependencies
     // Fire-and-forget operation for performance optimization
-    // eslint-disable-next-line no-unused-vars
-    const batchPreloadPromise = untrack(() => {
+    void untrack(() => {
       const datesParam = datesToPreload.join(',');
       return fetch(`/api/v2/analytics/species/daily/batch?dates=${datesParam}`)
         .then(response => {
@@ -936,8 +1083,13 @@
 
   // Helper function to process a detection update (extracted from handleNewDetection)
   function processDetectionUpdate(detection: Detection) {
-    // Trigger API fetch to get fresh data with animations enabled
-    fetchRecentDetections(true);
+    // Throttle API fetch to prevent request storms during high SSE activity
+    if (!sseFetchTimer) {
+      sseFetchTimer = setTimeout(() => {
+        fetchRecentDetections(true);
+        sseFetchTimer = null;
+      }, 150);
+    }
 
     // Queue daily summary update with debouncing
     queueDailySummaryUpdate(detection);
@@ -960,6 +1112,7 @@
     {showThumbnails}
     onPreviousDay={previousDay}
     onNextDay={nextDay}
+    onGoToToday={goToToday}
     onDateChange={handleDateChange}
   />
 

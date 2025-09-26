@@ -99,7 +99,8 @@
       "editSpecies": "Muokkaa lajia",
       "removeSpecies": "Poista laji",
       "dismissError": "Hylkää virhe",
-      "downloadCsv": "Lataa lajilista CSV-tiedostona"
+      "downloadCsv": "Lataa lajilista CSV-tiedostona",
+      "calendarNavigation": "Kalenterinavigointi: käytä nuolinäppäimiä siirtymiseen, Enter valitsee, Esc sulkee"
     },
     "modal": {
       "confirmAction": "Vahvista toiminto",
@@ -1473,6 +1474,7 @@
       }
     },
     "datePicker": {
+      "today": "Tänään",
       "feedback": {
         "endDateCleared": "Loppupäivä tyhjennetty kelvollisen alueen säilyttämiseksi",
         "startDateCleared": "Alkupäivä tyhjennetty kelvollisen alueen säilyttämiseksi",

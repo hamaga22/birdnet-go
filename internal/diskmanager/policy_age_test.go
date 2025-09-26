@@ -65,12 +65,12 @@ func TestAgeBasedCleanupFileTypeEligibility(t *testing.T) {
 		{"bubo_bubo_80p_20210102T150405Z.opus", false, ""},
 
 		// Non-audio files - should return errors
-		{"bubo_bubo_80p_20210102T150405Z.txt", true, "file type not eligible"},
-		{"bubo_bubo_80p_20210102T150405Z.jpg", true, "file type not eligible"},
-		{"bubo_bubo_80p_20210102T150405Z.png", true, "file type not eligible"},
-		{"bubo_bubo_80p_20210102T150405Z.db", true, "file type not eligible"},
-		{"bubo_bubo_80p_20210102T150405Z.csv", true, "file type not eligible"},
-		{"system_80p_20210102T150405Z.exe", true, "file type not eligible"},
+		{"bubo_bubo_80p_20210102T150405Z.txt", true, "not eligible for cleanup"},
+		{"bubo_bubo_80p_20210102T150405Z.jpg", true, "not eligible for cleanup"},
+		{"bubo_bubo_80p_20210102T150405Z.png", true, "not eligible for cleanup"},
+		{"bubo_bubo_80p_20210102T150405Z.db", true, "not eligible for cleanup"},
+		{"bubo_bubo_80p_20210102T150405Z.csv", true, "not eligible for cleanup"},
+		{"system_80p_20210102T150405Z.exe", true, "not eligible for cleanup"},
 	}
 
 	// Print the current list of allowed file types for debugging
@@ -93,7 +93,7 @@ func TestAgeBasedCleanupFileTypeEligibility(t *testing.T) {
 			mockInfo := createMockFileInfo(tc.name, 1024)
 
 			// Call parseFileInfo directly to test file extension checking
-			_, err := parseFileInfo(filepath.Join(testDir, tc.name), mockInfo)
+			_, err := parseFileInfo(filepath.Join(testDir, tc.name), mockInfo, allowedFileTypes)
 
 			// Debug logging
 			t.Logf("File: %s, Extension: %s, Error: %v",
@@ -535,7 +535,7 @@ func simulateAgeBasedCleanup(
 		}
 
 		// Parse the file info
-		fileData, err := parseFileInfo(filePath, fileInfo)
+		fileData, err := parseFileInfo(filePath, fileInfo, allowedFileTypes)
 		if err != nil {
 			continue
 		}
@@ -630,4 +630,4 @@ func (m *mockFileInfo) Size() int64        { return m.size }
 func (m *mockFileInfo) Mode() os.FileMode  { return m.mode }
 func (m *mockFileInfo) ModTime() time.Time { return m.modTime }
 func (m *mockFileInfo) IsDir() bool        { return m.isDir }
-func (m *mockFileInfo) Sys() interface{}   { return nil }
+func (m *mockFileInfo) Sys() any           { return nil }
