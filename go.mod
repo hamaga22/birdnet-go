@@ -32,7 +32,7 @@ require (
 	go.uber.org/mock v0.6.0
 	golang.org/x/crypto v0.42.0
 	golang.org/x/net v0.44.0
-	golang.org/x/term v0.35.0
+	golang.org/x/term v0.36.0
 	golang.org/x/text v0.29.0
 	google.golang.org/api v0.249.0
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
@@ -115,7 +115,7 @@ require (
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
 	golang.org/x/oauth2 v0.31.0
 	golang.org/x/sync v0.17.0
-	golang.org/x/sys v0.36.0
+	golang.org/x/sys v0.37.0
 	golang.org/x/time v0.13.0
 	google.golang.org/protobuf v1.36.8 // indirect
 )
