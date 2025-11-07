@@ -76,14 +76,45 @@ curl -fsSL https://github.com/tphakala/birdnet-go/raw/main/install.sh -o install
 bash ./install.sh
 ```
 
+## Development Setup
+
+For developers who want to contribute or build from source:
+
+> See [CONTRIBUTING.md](CONTRIBUTING.md#step-1-install-task-runner) for more details.
+
+```bash
+# Clone the repository
+git clone https://github.com/tphakala/birdnet-go.git
+cd birdnet-go
+
+# Install Task (if not already installed)
+# Linux: sh -c "$(curl --location https://taskfile.dev/install.sh)" -- -d -b /usr/local/bin
+# macOS: brew install go-task (assumes Homebrew is installed)
+
+# Setup development environment (Linux apt-based or macOS with homebrew)
+task setup-dev
+
+# Build the project
+task
+
+# Start development server with hot reload
+task dev_server # or "air realtime"
+```
+
+The `setup-dev` task will automatically install:
+
+- Go 1.25
+- Node.js LTS
+- Build tools (gcc, git, wget, etc.)
+- golangci-lint (Go linter)
+- air (hot reload for Go)
+- Frontend dependencies and Playwright browsers
+
 ## Web Dashboard
 
 <img src="doc/BirdNET-Go-dashboard.webp" />
 
 For detailed installation instructions, see the [installation documentation](doc/wiki/installation.md). For securing your BirdNET-Go installation, see the [security documentation](doc/wiki/security.md). See [recommended hardware](doc/wiki/hardware.md) for optimal performance.
-
-
-
 
 There is more detailed usage documentation at [Wiki](doc/wiki/guide.md)
 
@@ -94,18 +125,69 @@ Join our [Discord server](https://discord.gg/gcSCFGUtsd) for support, discussion
 ## Related Projects
 
 ### Core & Extensions
+
 - [BirdNET-Analyzer](https://github.com/birdnet-team/BirdNET-Analyzer) - Upstream project providing the BirdNET AI model for bird sound identification
 - [BirdNET-Go Classifiers](https://github.com/tphakala/birdnet-go-classifiers) - Enhanced BirdNET classifiers including additional species
 
 ### System Integration
+
 - [Cockpit BirdNET-Go](https://github.com/tphakala/cockpit-birdnet-go) - Web-based system management plugin for BirdNET-Go using Cockpit framework
 
 ### Migration Tools
+
 - [BirdNET-Pi2Go](https://github.com/tphakala/birdnet-pi2go) - Database conversion tool for migrating from BirdNET-Pi to BirdNET-Go
 
 ### Hardware Solutions
+
 - [BirdNET-Go ESP32 RTSP Microphone](https://github.com/Sukecz/birdnetgo-esp32-rtsp-mic) - ESP32-based RTSP streaming microphone for remote audio capture
 - [ESP32 Audio Streamer](https://github.com/jpmurray/esp32-audio-streamer) - Alternative ESP32 RTSP streaming solution for BirdNET-Go audio input
+
+## Contributing
+
+**Want to contribute?** We welcome contributions from the community! 🎉
+
+For comprehensive contributing guidelines, development setup, and workflow documentation, see [**CONTRIBUTING.md**](CONTRIBUTING.md).
+
+### Quick Start for Contributors
+
+**Experienced developers** can get started in 5 minutes:
+
+```bash
+git clone https://github.com/tphakala/birdnet-go.git && cd birdnet-go
+task setup-dev  # One command installs everything (Go, Node.js, tools, git hooks)
+air realtime    # Start developing with hot reload
+```
+
+**New to the project?** The [contributing guide](CONTRIBUTING.md) includes:
+
+- 📋 [TL;DR Quick Start](CONTRIBUTING.md#tldr---quick-start-for-experienced-developers) - 5-minute setup
+- 🔧 [Automated Environment Setup](CONTRIBUTING.md#development-environment-setup) - `task setup-dev` handles everything
+- 📖 [Development Workflow](CONTRIBUTING.md#development-workflow) - Hot reload, git hooks, testing
+- ⚖️ [License & Privacy](CONTRIBUTING.md#license-and-legal) - CC BY-NC-SA 4.0, privacy-by-design
+- 💬 [Discord Community](https://discord.gg/gcSCFGUtsd) - Get help and discuss features
+
+All contributions must follow:
+
+- ✅ Privacy-by-design principles
+- ✅ Code quality standards (automated via git hooks)
+- ✅ CC BY-NC-SA 4.0 license terms
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for complete details.
+
+## Data Sources
+
+### Taxonomy Data
+
+BirdNET-Go includes embedded taxonomy data derived from the eBird/Clements Checklist:
+
+- **Source**: [eBird API v2](https://api.ebird.org/v2/ref/taxonomy/ebird)
+- **Copyright**: © Cornell Lab of Ornithology
+- **License**: Used under eBird API Terms of Use for non-commercial purposes
+- **Attribution**: Taxonomy data powered by [eBird.org](https://ebird.org)
+- **Purpose**: Provides fast local genus/family lookups without requiring API calls
+- **Coverage**: 2,374 genera, 254 families, 11,145 species
+
+For more information about eBird's taxonomy, visit [eBird Taxonomy](https://ebird.org/science/use-ebird-data/the-ebird-taxonomy).
 
 ## License
 

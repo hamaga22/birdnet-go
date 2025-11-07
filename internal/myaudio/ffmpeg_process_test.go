@@ -31,7 +31,7 @@ func TestFFmpegStream_ProcessCleanupNoZombies(t *testing.T) {
 	}
 
 	// Go 1.25 synctest: Creates controlled time environment for deterministic process testing
-	synctest.Test(t, func(t *testing.T) { //nolint:thelper // Test body, not a helper
+	synctest.Test(t, func(t *testing.T) {
 
 		// Go 1.25: Mock command duration uses fake time - 100ms advances instantly
 		mockCmd := createMockFFmpegCommand(t, 100*time.Millisecond)
@@ -128,7 +128,7 @@ func TestFFmpegStream_RapidRestartNoZombies(t *testing.T) {
 	}
 
 	// Go 1.25 synctest: Creates controlled time environment for deterministic rapid restart testing
-	synctest.Test(t, func(t *testing.T) { //nolint:thelper // Test body, not a helper
+	synctest.Test(t, func(t *testing.T) {
 
 		audioChan := make(chan UnifiedAudioData, 10)
 		defer close(audioChan)
@@ -138,7 +138,7 @@ func TestFFmpegStream_RapidRestartNoZombies(t *testing.T) {
 		pidMu := sync.Mutex{}
 
 		// Simulate rapid restarts with deterministic timing
-		for i := 0; i < 5; i++ {
+		for i := range 5 {
 			stream := NewFFmpegStream(fmt.Sprintf("test://rapid-restart-%d", i), "tcp", audioChan)
 
 			// Go 1.25: Mock command duration uses fake time - 50ms advances instantly
@@ -257,7 +257,7 @@ func TestFFmpegStream_ConcurrentCleanup(t *testing.T) {
 
 	// Attempt concurrent cleanups
 	var wg sync.WaitGroup
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		wg.Go(func() {
 			stream.cleanupProcess()
 		})
@@ -368,7 +368,7 @@ func getChildProcesses(t *testing.T, parentPid int) []int {
 // With synctest, goroutine lifecycle testing becomes deterministic and runs instantly.
 func TestFFmpegStream_WaitGoroutineLeak(t *testing.T) {
 	// Go 1.25 synctest: Creates controlled environment for deterministic goroutine leak testing
-	synctest.Test(t, func(t *testing.T) { //nolint:thelper // Test body, not a helper
+	synctest.Test(t, func(t *testing.T) {
 
 		initialGoroutines := runtime.NumGoroutine()
 
@@ -376,7 +376,7 @@ func TestFFmpegStream_WaitGoroutineLeak(t *testing.T) {
 		defer close(audioChan)
 
 		// Run multiple cleanup cycles with deterministic timing
-		for i := 0; i < 5; i++ {
+		for i := range 5 {
 			stream := NewFFmpegStream(fmt.Sprintf("test://leak-%d", i), "tcp", audioChan)
 
 			// Go 1.25: Mock command duration uses fake time - 50ms advances instantly
@@ -421,7 +421,7 @@ func TestFFmpegStream_ProcessReapingAfterExit(t *testing.T) {
 	}
 
 	// Go 1.25 synctest: Creates controlled time environment for deterministic process reaping testing
-	synctest.Test(t, func(t *testing.T) { //nolint:thelper // Test body, not a helper
+	synctest.Test(t, func(t *testing.T) {
 
 		audioChan := make(chan UnifiedAudioData, 10)
 		defer close(audioChan)
@@ -481,9 +481,7 @@ func BenchmarkFFmpegStream_ProcessCleanup(b *testing.B) {
 	audioChan := make(chan UnifiedAudioData, 10)
 	defer close(audioChan)
 
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
+	for i := 0; b.Loop(); i++ {
 		stream := NewFFmpegStream(fmt.Sprintf("test://bench-%d", i), "tcp", audioChan)
 
 		mockCmd := createMockFFmpegCommand(b, 50*time.Millisecond)

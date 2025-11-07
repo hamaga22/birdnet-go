@@ -23,6 +23,7 @@ import (
 	"github.com/patrickmn/go-cache"
 	"github.com/tphakala/birdnet-go/internal/analysis/processor"
 	"github.com/tphakala/birdnet-go/internal/api/v2/auth"
+	"github.com/tphakala/birdnet-go/internal/birdnet"
 	"github.com/tphakala/birdnet-go/internal/conf"
 	"github.com/tphakala/birdnet-go/internal/datastore"
 	"github.com/tphakala/birdnet-go/internal/ebird"
@@ -32,6 +33,7 @@ import (
 	"github.com/tphakala/birdnet-go/internal/observability"
 	"github.com/tphakala/birdnet-go/internal/securefs"
 	"github.com/tphakala/birdnet-go/internal/security"
+	"github.com/tphakala/birdnet-go/internal/spectrogram"
 	"github.com/tphakala/birdnet-go/internal/suncalc"
 )
 
@@ -45,6 +47,7 @@ type Controller struct {
 	SunCalc             *suncalc.SunCalc
 	Processor           *processor.Processor
 	EBirdClient         *ebird.Client
+	TaxonomyDB          *birdnet.TaxonomyDatabase
 	logger              *log.Logger
 	controlChan         chan string
 	speciesExcludeMutex sync.RWMutex // Mutex for species exclude list operations
@@ -52,15 +55,16 @@ type Controller struct {
 	// When set to true, all settings modifications remain in memory only.
 	// This is primarily used in testing but can be used in production for read-only mode.
 	// Thread-safe: should be set before controller initialization.
-	DisableSaveSettings bool         // disables disk persistence of settings
-	settingsMutex       sync.RWMutex // Mutex for settings operations
-	detectionCache      *cache.Cache // Cache for detection queries
-	startTime           *time.Time
-	SFS                 *securefs.SecureFS     // Add SecureFS instance
-	apiLogger           *slog.Logger           // Structured logger for API operations
-	apiLevelVar         *slog.LevelVar         // Dynamic level control (type declaration)
-	apiLoggerClose      func() error           // Function to close the log file
-	metrics             *observability.Metrics // Shared metrics instance
+	DisableSaveSettings  bool         // disables disk persistence of settings
+	settingsMutex        sync.RWMutex // Mutex for settings operations
+	detectionCache       *cache.Cache // Cache for detection queries
+	startTime            *time.Time
+	SFS                  *securefs.SecureFS     // Add SecureFS instance
+	apiLogger            *slog.Logger           // Structured logger for API operations
+	apiLevelVar          *slog.LevelVar         // Dynamic level control (type declaration)
+	apiLoggerClose       func() error           // Function to close the log file
+	metrics              *observability.Metrics // Shared metrics instance
+	spectrogramGenerator *spectrogram.Generator // Shared spectrogram generator (initialized after SFS)
 
 	// Auth related fields
 	// AuthService stores the shared authentication service instance.
@@ -108,8 +112,8 @@ func ipExtractorFromCloudflareHeader(req *http.Request) string {
 	// 2. Check X-Forwarded-For (taking the first valid IP)
 	xff := req.Header.Get(echo.HeaderXForwardedFor)
 	if xff != "" {
-		parts := strings.Split(xff, ",")
-		for _, part := range parts {
+		parts := strings.SplitSeq(xff, ",")
+		for part := range parts {
 			ipStr := strings.TrimSpace(part)
 			ip := net.ParseIP(ipStr)
 			if ip != nil {
@@ -248,18 +252,19 @@ func NewWithOptions(e *echo.Echo, ds datastore.Interface, settings *conf.Setting
 	ctx, cancel := context.WithCancel(context.Background())
 
 	c := &Controller{
-		Echo:           e,
-		DS:             ds,
-		Settings:       settings,
-		BirdImageCache: birdImageCache,
-		SunCalc:        sunCalc,
-		controlChan:    controlChan,
-		logger:         logger,
-		detectionCache: cache.New(5*time.Minute, 10*time.Minute),
-		SFS:            sfs, // Assign SecureFS instance
-		metrics:        metrics,
-		ctx:            ctx,
-		cancel:         cancel,
+		Echo:                 e,
+		DS:                   ds,
+		Settings:             settings,
+		BirdImageCache:       birdImageCache,
+		SunCalc:              sunCalc,
+		controlChan:          controlChan,
+		logger:               logger,
+		detectionCache:       cache.New(5*time.Minute, 10*time.Minute),
+		SFS:                  sfs, // Assign SecureFS instance
+		metrics:              metrics,
+		ctx:                  ctx,
+		cancel:               cancel,
+		spectrogramGenerator: spectrogram.NewGenerator(settings, sfs, getSpectrogramLogger()), // Initialize shared generator
 	}
 
 	// Update spectrogram logger level based on debug setting
@@ -283,6 +288,35 @@ func NewWithOptions(e *echo.Echo, ds datastore.Interface, settings *conf.Setting
 		c.apiLogger = apiLogger
 		c.apiLoggerClose = closeFunc
 		logger.Printf("API structured logging initialized to %s", apiLogPath)
+	}
+
+	// Load local taxonomy database for fast species lookups
+	taxonomyDB, err := birdnet.LoadTaxonomyDatabase()
+	if err != nil {
+		if c.apiLogger != nil {
+			c.apiLogger.Warn("Failed to load taxonomy database", "error", err)
+			c.apiLogger.Warn("Species taxonomy lookups will fall back to eBird API")
+		} else {
+			logger.Printf("Warning: Failed to load taxonomy database: %v", err)
+			logger.Printf("Species taxonomy lookups will fall back to eBird API")
+		}
+		// Continue without taxonomy database - eBird API fallback will be used
+		c.TaxonomyDB = nil
+	} else {
+		c.TaxonomyDB = taxonomyDB
+		stats := taxonomyDB.Stats()
+		if c.apiLogger != nil {
+			c.apiLogger.Info("Loaded taxonomy database",
+				"genus_count", stats["genus_count"],
+				"family_count", stats["family_count"],
+				"species_count", stats["species_count"],
+				"version", taxonomyDB.Version,
+				"updated_at", taxonomyDB.UpdatedAt,
+			)
+		} else {
+			logger.Printf("Loaded taxonomy database: %v genera, %v families, %v species",
+				stats["genus_count"], stats["family_count"], stats["species_count"])
+		}
 	}
 
 	// If OAuth2Server is provided, setup authentication service and middleware function
@@ -434,6 +468,7 @@ func (c *Controller) initRoutes() {
 		{"settings routes", c.initSettingsRoutes},
 		{"filesystem routes", c.initFileSystemRoutes},
 		{"stream routes", c.initStreamRoutes},
+		{"stream health routes", c.initStreamHealthRoutes},
 		{"integration routes", c.initIntegrationsRoutes},
 		{"control routes", c.initControlRoutes},
 		{"auth routes", c.initAuthRoutes},
@@ -468,7 +503,7 @@ func (c *Controller) initRoutes() {
 // HealthCheck handles the API health check endpoint
 func (c *Controller) HealthCheck(ctx echo.Context) error {
 	// Create response structure
-	response := map[string]interface{}{
+	response := map[string]any{
 		"status":     "healthy",
 		"version":    c.Settings.Version,
 		"build_date": c.Settings.BuildDate,
@@ -508,13 +543,13 @@ func (c *Controller) HealthCheck(ctx echo.Context) error {
 	}
 
 	// Add system metrics
-	systemMetrics := make(map[string]interface{})
+	systemMetrics := make(map[string]any)
 
 	// Add placeholder CPU usage (would be implemented with actual metrics in production)
 	systemMetrics["cpu_usage"] = 0.0
 
 	// Add placeholder memory usage
-	memoryMetrics := map[string]interface{}{
+	memoryMetrics := map[string]any{
 		"used_percent": 0.0,
 		"total_mb":     0.0,
 		"used_mb":      0.0,
@@ -522,7 +557,7 @@ func (c *Controller) HealthCheck(ctx echo.Context) error {
 	systemMetrics["memory"] = memoryMetrics
 
 	// Add placeholder disk space
-	diskMetrics := map[string]interface{}{
+	diskMetrics := map[string]any{
 		"total_gb":     0.0,
 		"free_gb":      0.0,
 		"used_percent": 0.0,
@@ -662,7 +697,7 @@ func (c *Controller) HandleErrorForTest(ctx echo.Context, err error, message str
 }
 
 // Debug logs debug messages when debug mode is enabled
-func (c *Controller) Debug(format string, v ...interface{}) {
+func (c *Controller) Debug(format string, v ...any) {
 	if c.Settings.WebServer.Debug {
 		msg := fmt.Sprintf(format, v...)
 		c.logger.Printf("[DEBUG] %s", msg)
@@ -837,8 +872,8 @@ func (c *Controller) isAuthRequiredWithoutService(ctx echo.Context) bool {
 				// Check configured subnets
 				allowedSubnetsStr := c.Settings.Security.AllowSubnetBypass.Subnet
 				if allowedSubnetsStr != "" {
-					allowedSubnets := strings.Split(allowedSubnetsStr, ",")
-					for _, cidr := range allowedSubnets {
+					allowedSubnets := strings.SplitSeq(allowedSubnetsStr, ",")
+					for cidr := range allowedSubnets {
 						trimmedCIDR := strings.TrimSpace(cidr)
 						if trimmedCIDR == "" {
 							continue

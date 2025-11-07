@@ -33,6 +33,171 @@
 - `b.ResetTimer()` after benchmark setup
 - Use `t.Attr()` for test metadata (Go 1.25)
 
+### Test Cleanup Best Practices
+
+- **Use `t.Cleanup()` instead of `defer`** for test resource cleanup
+- `t.Cleanup()` runs after all defers, providing more predictable cleanup order
+- Particularly important for tests that restore global state
+- Example:
+  ```go
+  func TestWithGlobalState(t *testing.T) {
+      // ❌ Wrong - defer may run at unpredictable times
+      originalValue := GetGlobalValue()
+      defer SetGlobalValue(originalValue)
+
+      // ✅ Correct - cleanup runs after all test defers
+      originalValue := GetGlobalValue()
+      t.Cleanup(func() {
+          SetGlobalValue(originalValue)
+      })
+  }
+  ```
+
+### Test Parallelization Guidelines
+
+- Add `t.Parallel()` to **test functions** and **subtests** for speed
+- **NEVER parallelize tests that**:
+  - Mutate global state (e.g., `conf.SetTestSettings()`)
+  - Share mutable data structures without synchronization
+  - Use shared map references without cloning
+- **Always clone shared test data** in subtests:
+  ```go
+  import "maps"
+
+  customSeasons := map[string]Season{...}
+  for _, tt := range tests {
+      t.Run(tt.name, func(t *testing.T) {
+          t.Parallel()
+          // Clone to avoid aliasing - prevents false positives
+          settings.Seasons = maps.Clone(customSeasons)
+      })
+  }
+  ```
+
+### Test Helper File Naming
+
+- Name test-only helper files with `_test.go` suffix
+- **Wrong**: `internal/conf/test_helpers.go` (included in production builds)
+- **Correct**: `internal/conf/test_helpers_test.go` (test-only)
+- This ensures helpers with `*testing.T` parameters don't bloat binaries
+
+### Benchmark Best Practices
+
+- Always call `b.ReportAllocs()` before `b.ResetTimer()` to track allocations
+- Use `b.Loop()` (Go 1.24+) for cleaner benchmark loops (optional)
+- Benchmark example:
+  ```go
+  func BenchmarkValidation(b *testing.B) {
+      cfg := &Config{...}
+      b.ReportAllocs()
+      b.ResetTimer()
+      for i := 0; i < b.N; i++ {
+          _ = Validate(cfg)
+      }
+  }
+  ```
+
+### Mock Generation with Mockery
+
+**IMPORTANT**: Never manually write mocks. Use mockery for automated mock generation.
+
+**Quick Start:**
+
+```bash
+# Generate mocks for all interfaces
+go generate ./internal/datastore
+
+# Or use mockery directly
+mockery --config .mockery.yaml
+```
+
+**Using Generated Mocks in Tests:**
+
+```go
+import (
+    "testing"
+    "github.com/stretchr/testify/mock"
+    "github.com/tphakala/birdnet-go/internal/datastore/mocks"
+)
+
+func TestMyFunction(t *testing.T) {
+    // Create mock
+    mockDS := mocks.NewMockInterface(t)
+
+    // Set expectations using .EXPECT() pattern
+    mockDS.EXPECT().
+        Save(mock.Anything, mock.Anything).
+        Return(nil).
+        Once()
+
+    // Use the mock
+    err := myFunction(mockDS)
+
+    // Assertions happen automatically
+}
+```
+
+**Critical Rules:**
+
+- **Conditional Mock Calls**: Use `.Maybe()` for methods called conditionally
+
+```go
+// Method only called when NotificationSuppressionHours > 0
+mockDS.EXPECT().
+    GetActiveNotificationHistory(mock.AnythingOfType("time.Time")).
+    Return([]datastore.NotificationHistory{}, nil).
+    Maybe()  // Won't fail if not called
+```
+
+- **Async Operations**: Use `.Maybe()` for methods called in goroutines
+
+```go
+// Called asynchronously in RecordNotificationSent
+mockDS.EXPECT().
+    SaveNotificationHistory(mock.AnythingOfType("*datastore.NotificationHistory")).
+    Return(nil).
+    Maybe()  // Non-blocking operation
+```
+
+- **Test Helpers**: Always use `t.Helper()` in setup functions
+
+```go
+func createTestTracker(t *testing.T) *Tracker {
+    t.Helper()  // Stack traces point to caller, not this function
+    // ... setup
+}
+```
+
+**Common Patterns:**
+
+```go
+// Match any argument type
+mockDS.EXPECT().Get(mock.Anything).Return(note, nil)
+
+// Match specific type
+mockDS.EXPECT().Save(mock.AnythingOfType("*datastore.Note")).Return(nil)
+
+// Multiple calls
+mockDS.EXPECT().Get(mock.Anything).Return(note, nil).Times(3)
+
+// Return different values on subsequent calls
+mockDS.EXPECT().Get("123").Return(note1, nil).Once()
+mockDS.EXPECT().Get("123").Return(note2, nil).Once()
+```
+
+**When Interface Changes:**
+
+1. Update the interface in `internal/datastore/interfaces.go`
+2. Run `go generate ./internal/datastore`
+3. Mocks automatically regenerate with all methods
+4. **Never** manually edit files in `internal/datastore/mocks/`
+
+**Documentation:**
+
+- Complete guide: `internal/datastore/mocks/README.md`
+- Configuration: `.mockery.yaml`
+- Migration guide and examples in README
+
 ## Go 1.25 Testing Features
 
 See [Go 1.25 Release Notes](https://go.dev/doc/go1.25) for complete changelog.
@@ -81,7 +246,7 @@ func TestAPI(t *testing.T) {
     // Add test metadata
     t.Attr("component", "api")
     t.Attr("version", "v2")
-    
+
     // Structured output
     output := t.Output()
     fmt.Fprintf(output, "Request: %v\n", req)

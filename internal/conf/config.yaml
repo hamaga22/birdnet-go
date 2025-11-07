@@ -16,7 +16,7 @@ main:
 # BirdNET model specific settings
 birdnet:
   sensitivity: 1.0        # sigmoid sensitivity, 0.1 to 1.5
-  threshold: 0.8          # threshold for prediction confidence to report, 0.0 to 1.0
+  threshold: 0.7          # threshold for prediction confidence to report, 0.0 to 1.0
   overlap: 1.5            # overlap between chunks, 0.0 to 2.9
   threads: 0              # 0 to use all available CPU threads
   locale: en-us           # language to use for labels
@@ -58,9 +58,10 @@ realtime:
       retention:
         policy: usage     # retention policy: none, age or usage
         maxage: 30d       # age policy: maximum age of clips to keep before starting evictions
-        maxusage: 80%     # usage policy: percentage of disk usage to trigger eviction        
+        maxusage: 80%     # usage policy: percentage of disk usage to trigger eviction
         minclips: 10      # minumum number of clips per species to keep before starting evictions
         keepspectrograms: true # true to keep spectrograms even when clips are deleted
+        checkInterval: 15 # cleanup check interval in minutes (default: 15)
 
 
   dashboard:
@@ -187,9 +188,16 @@ webserver:
     rotationday: 0        # day of the week for weekly rotation, 0 = Sunday
 
 security:
-  # host is required for AutoTLS and OAuth providers
-  # Must be a fully qualified domain name (e.g., "birdnet.example.com")
-  # The domain must point to this server's public IP address
+  # host is used for:
+  # - AutoTLS certificate generation (when autotls: true)
+  # - OAuth redirect URLs (when using social authentication)
+  # - Notification URLs in push notifications
+  #
+  # Set this to your public hostname when using a reverse proxy
+  # (e.g., "birdnet.home.arpa", "birdnet.example.com")
+  #
+  # Can also be set via BIRDNET_HOST environment variable
+  # Falls back to "localhost" if not configured (works for direct access only)
   host: ""
   
   # AutoTLS enables automatic TLS certificate management via Let's Encrypt
@@ -246,3 +254,148 @@ output:
 # Sentry telemetry configuration (opt-in, respects EU privacy laws)
 sentry:
   enabled: false          # false by default, must be explicitly enabled by user (opt-in)
+
+# Notification settings
+notification:
+  templates:
+    newspecies:
+      title: "New Species: {{.CommonName}}"
+      message: "First detection of {{.CommonName}} ({{.ScientificName}}) with {{.ConfidencePercent}}% confidence at {{.DetectionTime}}. View: {{.DetectionURL}}"
+  push:
+    enabled: false
+    default_timeout: 30s
+    max_retries: 3
+    retry_delay: 5s
+
+    # Circuit breaker configuration
+    # Protects against cascading failures by temporarily blocking requests to failing providers
+    circuit_breaker:
+      enabled: true
+      max_failures: 5          # Number of consecutive failures before opening circuit
+      timeout: 30s             # Time to wait before attempting half-open state
+      half_open_max_requests: 1  # Number of test requests allowed in half-open state
+
+    # Health check configuration
+    # Periodically verifies provider availability and updates metrics
+    health_check:
+      enabled: true
+      interval: 60s  # How often to check provider health
+      timeout: 10s   # Timeout for each health check
+
+    # Rate limiting configuration
+    # Prevents overwhelming external APIs with too many requests
+    # Disabled by default - enable if you need additional DoS protection beyond circuit breakers
+    rate_limiting:
+      enabled: false           # Enable to activate rate limiting
+      requests_per_minute: 60  # Maximum average request rate
+      burst_size: 10           # Maximum burst capacity for spikes
+
+    providers:
+      - type: shoutrrr
+        enabled: false
+        name: "telegram-alerts"
+        urls:
+          - "telegram://<YOUR_BOT_TOKEN>@telegram?chats=<YOUR_CHAT_ID>"
+        timeout: 10s
+        filter:
+          types: ["error", "detection"]
+          priorities: ["critical", "high"]
+      - type: script
+        enabled: false
+        name: test-script
+        command: scripts/your-push-script.sh
+        args: ["ok"] # use ["fail"] to test non-zero exit
+        environment:
+        input_format: both    # Options: "json" (stdin only), "env" (env vars only), "both" (env + JSON stdin)
+        filter:
+          types: ["error", "warning", "info", "detection", "system"]
+          priorities: []
+          components: []
+          metadata_filters: {}
+            # Filter by confidence threshold (supports > and < operators)
+            # Examples:
+            #   confidence: ">0.8"   # Only notifications with >80% confidence
+            #   confidence: "<0.3"   # Only low-confidence notifications
+            #
+            # Other metadata fields use exact string matching:
+            #   species: "Northern Cardinal"
+            #   location: "backyard"
+      # Example 1: Webhook with Environment Variables (recommended for Docker/containers)
+      - type: webhook
+        enabled: false
+        name: "slack-webhook"
+        endpoints:
+          - url: "https://hooks.slack.com/services/YOUR/WEBHOOK/PATH"
+            auth:
+              type: bearer
+              token: "${SLACK_WEBHOOK_TOKEN}"  # Expands from environment variable
+        filter:
+          types: ["error", "detection"]
+
+      # Example 2: Webhook with File-based Secrets (recommended for Kubernetes/Docker Swarm)
+      # - type: webhook
+      #   enabled: false
+      #   name: "api-service"
+      #   endpoints:
+      #     - url: "https://api.example.com/webhooks/birdnet"
+      #       auth:
+      #         type: bearer
+      #         token_file: "/run/secrets/api_token"  # Read from mounted secret file
+
+      # Example 3: Multiple Endpoints with Failover
+      # - type: webhook
+      #   enabled: false
+      #   name: "multi-endpoint"
+      #   endpoints:
+      #     - url: "https://primary.example.com/webhook"
+      #       method: POST
+      #       timeout: 10s
+      #       auth:
+      #         type: bearer
+      #         token: "${PRIMARY_TOKEN}"
+      #     - url: "https://backup.example.com/webhook"
+      #       method: POST
+      #       timeout: 15s
+      #       auth:
+      #         type: basic
+      #         user: "${BACKUP_USER}"
+      #         pass_file: "/run/secrets/backup_pass"  # Mix env vars and files
+
+      # Example 4: Custom Authentication Headers
+      # - type: webhook
+      #   enabled: false
+      #   name: "custom-auth"
+      #   endpoints:
+      #     - url: "https://api.example.com/webhook"
+      #       headers:
+      #         X-Custom-Header: "value"
+      #       auth:
+      #         type: custom
+      #         header: "X-API-Key"
+      #         value: "${API_KEY}"  # Or use value_file for file-based secret
+
+      # Example 5: Custom JSON Template
+      # - type: webhook
+      #   enabled: false
+      #   name: "custom-format"
+      #   template: |
+      #     {
+      #       "event": "{{.Type}}",
+      #       "severity": "{{.Priority}}",
+      #       "title": "{{.Title}}",
+      #       "message": "{{.Message}}",
+      #       "timestamp": "{{.Timestamp}}"
+      #     }
+      #   endpoints:
+      #     - url: "https://api.example.com/events"
+      #       auth:
+      #         type: bearer
+      #         token: "${EVENT_API_TOKEN}"
+
+      # Security Best Practices:
+      # 1. NEVER commit secrets to git - use environment variables or file references
+      # 2. For Docker: docker run -e WEBHOOK_TOKEN=xyz birdnet-go
+      # 3. For Kubernetes: Mount secrets as files in /run/secrets/
+      # 4. For development: Create .env file (add to .gitignore!)
+      # 5. Use ${VAR:-default} syntax for optional env vars with defaults
+      # 6. Set file permissions to 0400 or 0600 for secret files

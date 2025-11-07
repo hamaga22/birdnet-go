@@ -9,25 +9,25 @@ func TestScrubContextMap(t *testing.T) {
 
 	tests := []struct {
 		name     string
-		input    map[string]interface{}
-		expected func(map[string]interface{}) bool
+		input    map[string]any
+		expected func(map[string]any) bool
 	}{
 		{
 			name:  "nil map",
 			input: nil,
-			expected: func(result map[string]interface{}) bool {
+			expected: func(result map[string]any) bool {
 				return result == nil
 			},
 		},
 		{
 			name: "URL scrubbing",
-			input: map[string]interface{}{
+			input: map[string]any{
 				"url":        "https://example.com/path",
 				"endpoint":   "http://api.example.com",
 				"rtsp_url":   "rtsp://camera.local/stream1",
 				"stream_url": "https://stream.example.com/live",
 			},
-			expected: func(result map[string]interface{}) bool {
+			expected: func(result map[string]any) bool {
 				// All URLs should be anonymized
 				for k := range result {
 					if result[k] == "https://example.com/path" {
@@ -39,25 +39,25 @@ func TestScrubContextMap(t *testing.T) {
 		},
 		{
 			name: "Error message scrubbing",
-			input: map[string]interface{}{
+			input: map[string]any{
 				"error":       "Connection failed to https://api.example.com",
 				"message":     "Failed to process request",
 				"description": "Error occurred at line 42",
 			},
-			expected: func(result map[string]interface{}) bool {
+			expected: func(result map[string]any) bool {
 				// Messages should be scrubbed
 				return len(result) == 3
 			},
 		},
 		{
 			name: "IP address anonymization",
-			input: map[string]interface{}{
-				"ip":         "192.168.1.1",
-				"client_ip":  "10.0.0.1",
+			input: map[string]any{
+				"ip":          "192.168.1.1",
+				"client_ip":   "10.0.0.1",
 				"remote_addr": "::1",
-				"source_ip":  "172.16.0.1",
+				"source_ip":   "172.16.0.1",
 			},
-			expected: func(result map[string]interface{}) bool {
+			expected: func(result map[string]any) bool {
 				// IPs should be anonymized
 				for k := range result {
 					if result[k] == "192.168.1.1" {
@@ -69,13 +69,13 @@ func TestScrubContextMap(t *testing.T) {
 		},
 		{
 			name: "Credential redaction",
-			input: map[string]interface{}{
+			input: map[string]any{
 				"token":    "secret-token-123",
 				"api_key":  "api-key-456",
 				"password": "super-secret",
 				"secret":   "confidential",
 			},
-			expected: func(result map[string]interface{}) bool {
+			expected: func(result map[string]any) bool {
 				// All credentials should be "[REDACTED]"
 				for k := range result {
 					if result[k] != "[REDACTED]" {
@@ -87,14 +87,14 @@ func TestScrubContextMap(t *testing.T) {
 		},
 		{
 			name: "Mixed content",
-			input: map[string]interface{}{
+			input: map[string]any{
 				"url":      "https://example.com",
 				"token":    "secret",
 				"count":    42,
 				"enabled":  true,
 				"metadata": "some data",
 			},
-			expected: func(result map[string]interface{}) bool {
+			expected: func(result map[string]any) bool {
 				// URL should be anonymized, token redacted, others unchanged
 				return result["token"] == "[REDACTED]" &&
 					result["count"] == 42 &&
@@ -225,6 +225,103 @@ func TestScrubIPAddress(t *testing.T) {
 			}
 			if tt.input == "" && result != "" {
 				t.Errorf("scrubIPAddress() should return empty string for empty input, but got: %s", result)
+			}
+		})
+	}
+}
+
+func TestEnrichWithTemplateData(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		notification *Notification
+		templateData *TemplateData
+		wantNil      bool
+	}{
+		{
+			name:         "nil notification",
+			notification: nil,
+			templateData: &TemplateData{
+				DetectionID:       "1",
+				DetectionPath:     "/ui/detections/1",
+				DetectionURL:      "http://localhost/detections/1",
+				ImageURL:          "http://localhost/image.jpg",
+				ConfidencePercent: "95",
+				DetectionTime:     "14:30:00",
+				DetectionDate:     "2025-10-27",
+				Latitude:          42.3601,
+				Longitude:         -71.0589,
+				Location:          "Test Location",
+			},
+			wantNil: true,
+		},
+		{
+			name:         "nil template data",
+			notification: NewNotification(TypeDetection, PriorityHigh, "Test", "Test Message"),
+			templateData: nil,
+			wantNil:      false,
+		},
+		{
+			name:         "valid notification and template data",
+			notification: NewNotification(TypeDetection, PriorityHigh, "Test", "Test Message"),
+			templateData: &TemplateData{
+				DetectionID:       "1",
+				DetectionPath:     "/ui/detections/1",
+				DetectionURL:      "http://localhost/detections/1",
+				ImageURL:          "http://localhost/image.jpg",
+				ConfidencePercent: "95",
+				DetectionTime:     "14:30:00",
+				DetectionDate:     "2025-10-27",
+				Latitude:          42.3601,
+				Longitude:         -71.0589,
+				Location:          "Test Location",
+			},
+			wantNil: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			result := EnrichWithTemplateData(tt.notification, tt.templateData)
+
+			if tt.wantNil && result != nil {
+				t.Errorf("EnrichWithTemplateData() expected nil, got %v", result)
+				return
+			}
+
+			if !tt.wantNil && result == nil {
+				t.Errorf("EnrichWithTemplateData() expected non-nil result")
+				return
+			}
+
+			// Verify metadata was added when both inputs are valid
+			if tt.notification != nil && tt.templateData != nil && result != nil {
+				// Verify all field values match expected template data
+				expectedValues := map[string]any{
+					"bg_detection_id":       tt.templateData.DetectionID,
+					"bg_detection_path":     tt.templateData.DetectionPath,
+					"bg_detection_url":      tt.templateData.DetectionURL,
+					"bg_image_url":          tt.templateData.ImageURL,
+					"bg_confidence_percent": tt.templateData.ConfidencePercent,
+					"bg_detection_time":     tt.templateData.DetectionTime,
+					"bg_detection_date":     tt.templateData.DetectionDate,
+					"bg_latitude":           tt.templateData.Latitude,
+					"bg_longitude":          tt.templateData.Longitude,
+					"bg_location":           tt.templateData.Location,
+				}
+
+				for field, expectedValue := range expectedValues {
+					actualValue, exists := result.Metadata[field]
+					if !exists {
+						t.Errorf("EnrichWithTemplateData() missing expected field: %s", field)
+						continue
+					}
+					if actualValue != expectedValue {
+						t.Errorf("%s = %v, want %v", field, actualValue, expectedValue)
+					}
+				}
 			}
 		})
 	}

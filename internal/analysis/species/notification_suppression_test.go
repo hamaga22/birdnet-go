@@ -1,6 +1,7 @@
 package species
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -11,12 +12,25 @@ import (
 // mockSpeciesDatastore implements SpeciesDatastore interface for testing
 type mockSpeciesDatastore struct{}
 
-func (m *mockSpeciesDatastore) GetNewSpeciesDetections(startDate, endDate string, limit, offset int) ([]datastore.NewSpeciesData, error) {
+func (m *mockSpeciesDatastore) GetNewSpeciesDetections(ctx context.Context, startDate, endDate string, limit, offset int) ([]datastore.NewSpeciesData, error) {
 	return []datastore.NewSpeciesData{}, nil
 }
 
-func (m *mockSpeciesDatastore) GetSpeciesFirstDetectionInPeriod(startDate, endDate string, limit, offset int) ([]datastore.NewSpeciesData, error) {
+func (m *mockSpeciesDatastore) GetSpeciesFirstDetectionInPeriod(ctx context.Context, startDate, endDate string, limit, offset int) ([]datastore.NewSpeciesData, error) {
 	return []datastore.NewSpeciesData{}, nil
+}
+
+// BG-17 fix: Add notification history methods
+func (m *mockSpeciesDatastore) GetActiveNotificationHistory(after time.Time) ([]datastore.NotificationHistory, error) {
+	return []datastore.NotificationHistory{}, nil
+}
+
+func (m *mockSpeciesDatastore) SaveNotificationHistory(history *datastore.NotificationHistory) error {
+	return nil
+}
+
+func (m *mockSpeciesDatastore) DeleteExpiredNotificationHistory(before time.Time) (int64, error) {
+	return 0, nil
 }
 
 // TestNotificationSuppression tests the simplified notification suppression logic
@@ -113,7 +127,7 @@ func TestNotificationSuppressionThreadSafety(t *testing.T) {
 
 	// Goroutine 1: Record notifications
 	go func() {
-		for i := 0; i < 100; i++ {
+		for range 100 {
 			tracker.RecordNotificationSent("Species1", now)
 			tracker.RecordNotificationSent("Species2", now)
 		}
@@ -122,7 +136,7 @@ func TestNotificationSuppressionThreadSafety(t *testing.T) {
 
 	// Goroutine 2: Check suppression
 	go func() {
-		for i := 0; i < 100; i++ {
+		for range 100 {
 			tracker.ShouldSuppressNotification("Species1", now)
 			tracker.ShouldSuppressNotification("Species2", now)
 		}
@@ -131,7 +145,7 @@ func TestNotificationSuppressionThreadSafety(t *testing.T) {
 
 	// Goroutine 3: Cleanup
 	go func() {
-		for i := 0; i < 10; i++ {
+		for range 10 {
 			tracker.CleanupOldNotificationRecords(now)
 		}
 		done <- true

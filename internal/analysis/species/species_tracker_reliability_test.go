@@ -18,6 +18,7 @@ import (
 
 	"github.com/tphakala/birdnet-go/internal/conf"
 	"github.com/tphakala/birdnet-go/internal/datastore"
+	"github.com/tphakala/birdnet-go/internal/datastore/mocks"
 )
 
 // TestConcurrentAccessUnderLoad tests species tracker under high concurrent load
@@ -92,12 +93,6 @@ func runConcurrentLoadTest(t *testing.T, name string, numGoroutines, operationsP
 func createTrackerForConcurrentTest(t *testing.T, enableYearly, enableSeasonal bool) *SpeciesTracker {
 	t.Helper()
 
-	ds := &MockSpeciesDatastore{}
-	ds.On("GetNewSpeciesDetections", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-		Return([]datastore.NewSpeciesData{}, nil)
-	ds.On("GetSpeciesFirstDetectionInPeriod", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-		Return([]datastore.NewSpeciesData{}, nil)
-
 	settings := &conf.SpeciesTrackingSettings{
 		Enabled:              true,
 		NewSpeciesWindowDays: 14,
@@ -112,16 +107,14 @@ func createTrackerForConcurrentTest(t *testing.T, enableYearly, enableSeasonal b
 		},
 	}
 
-	tracker := NewTrackerFromSettings(ds, settings)
-	require.NotNil(t, tracker)
-	require.NoError(t, tracker.InitFromDatabase())
+	tracker, _ := createTestTrackerWithMocks(t, settings)
 	return tracker
 }
 
 // generateSpeciesNames creates a list of species names for testing
 func generateSpeciesNames(count int) []string {
 	species := make([]string, count)
-	for i := 0; i < count; i++ {
+	for i := range count {
 		species[i] = fmt.Sprintf("Species_%d", i)
 	}
 	return species
@@ -134,7 +127,7 @@ func executeConcurrentOperations(tracker *SpeciesTracker, species []string,
 	var wg sync.WaitGroup
 
 	// Launch concurrent goroutines
-	for i := 0; i < numGoroutines; i++ {
+	for i := range numGoroutines {
 		wg.Add(1)
 		go func(grID int) {
 			defer wg.Done()
@@ -153,7 +146,7 @@ func runGoroutineOperations(tracker *SpeciesTracker, species []string,
 
 	rnd := rand.New(rand.NewSource(time.Now().UnixNano() + int64(grID)))
 
-	for op := 0; op < operationsPerGR; op++ {
+	for range operationsPerGR {
 		atomic.AddInt64(totalOps, 1)
 
 		speciesName := species[rnd.Intn(len(species))]
@@ -299,47 +292,56 @@ func TestDatabaseFailureRecovery(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Logf("Testing database failure scenario: %s", tt.description)
 
-			ds := &MockSpeciesDatastore{}
+			ds := mocks.NewMockInterface(t)
 
 			// Configure mock behavior based on failure type
 			switch tt.failureType {
 			case "all_fail":
-				ds.On("GetNewSpeciesDetections", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+				ds.On("GetNewSpeciesDetections", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
 					Return(nil, fmt.Errorf("database connection failed"))
-				ds.On("GetSpeciesFirstDetectionInPeriod", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-					Return(nil, fmt.Errorf("database connection failed"))
+				ds.On("GetSpeciesFirstDetectionInPeriod", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+					Return(nil, fmt.Errorf("database connection failed")).Maybe() // Not called if GetNewSpeciesDetections fails first
 
 			case "lifetime_fail":
-				ds.On("GetNewSpeciesDetections", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+				ds.On("GetNewSpeciesDetections", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
 					Return(nil, fmt.Errorf("lifetime data load failed"))
-				ds.On("GetSpeciesFirstDetectionInPeriod", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-					Return([]datastore.NewSpeciesData{}, nil)
+				ds.On("GetSpeciesFirstDetectionInPeriod", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+					Return([]datastore.NewSpeciesData{}, nil).Maybe()
 
 			case "timeout_then_success":
 				// First call fails, subsequent calls succeed
-				ds.On("GetNewSpeciesDetections", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+				ds.On("GetNewSpeciesDetections", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
 					Return(nil, fmt.Errorf("timeout")).Once()
-				ds.On("GetNewSpeciesDetections", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+				ds.On("GetNewSpeciesDetections", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
 					Return([]datastore.NewSpeciesData{
 						{ScientificName: "Test_Species", FirstSeenDate: "2024-01-01"},
-					}, nil)
-				ds.On("GetSpeciesFirstDetectionInPeriod", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-					Return([]datastore.NewSpeciesData{}, nil)
+					}, nil).Maybe()
+				// BG-17: InitFromDatabase requires notification history
+				ds.On("GetActiveNotificationHistory", mock.AnythingOfType("time.Time")).
+					Return([]datastore.NotificationHistory{}, nil).Maybe()
+				ds.On("GetSpeciesFirstDetectionInPeriod", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+					Return([]datastore.NewSpeciesData{}, nil).Maybe()
 
 			case "empty_results":
-				ds.On("GetNewSpeciesDetections", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-					Return([]datastore.NewSpeciesData{}, nil)
-				ds.On("GetSpeciesFirstDetectionInPeriod", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-					Return([]datastore.NewSpeciesData{}, nil)
+				ds.On("GetNewSpeciesDetections", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+					Return([]datastore.NewSpeciesData{}, nil).Maybe()
+				// BG-17: InitFromDatabase now loads notification history
+				ds.On("GetActiveNotificationHistory", mock.AnythingOfType("time.Time")).
+					Return([]datastore.NotificationHistory{}, nil).Maybe()
+				ds.On("GetSpeciesFirstDetectionInPeriod", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+					Return([]datastore.NewSpeciesData{}, nil).Maybe()
 
 			case "corrupt_data":
-				ds.On("GetNewSpeciesDetections", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+				ds.On("GetNewSpeciesDetections", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
 					Return([]datastore.NewSpeciesData{
 						{ScientificName: "", FirstSeenDate: "invalid-date"},            // Invalid data
 						{ScientificName: "Valid_Species", FirstSeenDate: "2024-01-01"}, // Valid data
-					}, nil)
-				ds.On("GetSpeciesFirstDetectionInPeriod", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-					Return([]datastore.NewSpeciesData{}, nil)
+					}, nil).Maybe()
+				// BG-17: InitFromDatabase requires notification history
+				ds.On("GetActiveNotificationHistory", mock.AnythingOfType("time.Time")).
+					Return([]datastore.NotificationHistory{}, nil).Maybe()
+				ds.On("GetSpeciesFirstDetectionInPeriod", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+					Return([]datastore.NewSpeciesData{}, nil).Maybe()
 			}
 
 			settings := &conf.SpeciesTrackingSettings{

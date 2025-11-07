@@ -2,19 +2,15 @@
 package api
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io/fs"
-	"log"
 	"log/slog"
 	"math"
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,6 +22,7 @@ import (
 	"github.com/tphakala/birdnet-go/internal/logging"
 	"github.com/tphakala/birdnet-go/internal/myaudio"
 	"github.com/tphakala/birdnet-go/internal/securefs"
+	"github.com/tphakala/birdnet-go/internal/spectrogram"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -55,14 +52,6 @@ const (
 	MimeTypeM4A  = "audio/mp4"
 	MimeTypeOGG  = "audio/ogg"
 )
-
-// spectrogramSizes maps size names to pixel widths
-var spectrogramSizes = map[string]int{
-	"sm": SpectrogramSizeSm,
-	"md": SpectrogramSizeMd,
-	"lg": SpectrogramSizeLg,
-	"xl": SpectrogramSizeXl,
-}
 
 // isValidFilename checks if a filename is valid for use in Content-Disposition header
 func isValidFilename(filename string) bool {
@@ -145,6 +134,7 @@ func (c *Controller) initMediaRoutes() {
 	c.Echo.GET("/api/v2/audio/:id", c.ServeAudioByID)
 	c.Echo.GET("/api/v2/spectrogram/:id", c.ServeSpectrogramByID)
 	c.Echo.GET("/api/v2/spectrogram/:id/status", c.GetSpectrogramStatus)
+	c.Echo.POST("/api/v2/spectrogram/:id/generate", c.GenerateSpectrogramByID)
 
 	// Convenient combined endpoint (redirects to ID-based internally)
 	c.Group.GET("/media/audio", c.ServeAudioByQueryID)
@@ -373,7 +363,7 @@ func (c *Controller) ServeAudioByID(ctx echo.Context) error {
 	if err != nil {
 		// Check if error is due to record not found
 		if errors.Is(err, os.ErrNotExist) || strings.Contains(err.Error(), "not found") { // Adapt based on datastore error type
-			return c.HandleError(ctx, err, "Clip path not found for note ID", http.StatusNotFound)
+			return c.HandleError(ctx, err, "No audio clip available for this note", http.StatusNotFound)
 		}
 		return c.HandleError(ctx, err, "Failed to get clip path for note", http.StatusInternalServerError)
 	}
@@ -468,40 +458,62 @@ func (c *Controller) spectrogramHTTPError(ctx echo.Context, err error) error {
 	}
 }
 
-// ServeSpectrogramByID serves a spectrogram image based on note ID using SecureFS
+// spectrogramParameters holds parsed query parameters for spectrogram requests.
+// This struct is reusable across multiple endpoints.
+type spectrogramParameters struct {
+	width   int    // Pixel width for spectrogram
+	sizeStr string // Size parameter value (for URL generation)
+	raw     bool   // Whether to generate raw spectrogram without axes
+}
+
+// parseSpectrogramParameters extracts and validates spectrogram parameters from the request.
+// This is a reusable helper used by multiple endpoints.
 //
-// Route: GET /api/v2/spectrogram/:id
-//
-// Query Parameters:
+// Parameters:
 //   - size: Spectrogram size - "sm" (400px), "md" (800px), "lg" (1000px), "xl" (1200px)
-//     Default: "md"
 //   - width: Legacy parameter for custom width (1-2000px). Ignored if 'size' is present.
 //   - raw: Whether to generate raw spectrogram without axes/legends
-//     Default: true (for backward compatibility with cached spectrograms)
-//     Accepts: "true", "false", "1", "0", "t", "f", "yes", "no", "on", "off"
-//
-// The raw parameter defaults to true to maintain compatibility with existing cached
-// spectrograms from the old HTMX API which generated raw spectrograms by default.
-func (c *Controller) ServeSpectrogramByID(ctx echo.Context) error {
-	noteID := ctx.Param("id")
+func parseSpectrogramParameters(ctx echo.Context) spectrogramParameters {
+	params := spectrogramParameters{
+		width:   SpectrogramSizeMd, // Default width (md)
+		sizeStr: ctx.QueryParam("size"),
+		raw:     parseRawParameter(ctx.QueryParam("raw")),
+	}
+
+	// Parse size parameter
+	if params.sizeStr != "" {
+		if validWidth, err := spectrogram.SizeToPixels(params.sizeStr); err == nil {
+			params.width = validWidth
+		}
+		// Invalid size parameter falls back to width parameter or default
+	}
+
+	// Legacy width parameter support (only if size not specified)
+	widthStr := ctx.QueryParam("width")
+	if widthStr != "" && params.sizeStr == "" {
+		if parsedWidth, err := strconv.Atoi(widthStr); err == nil && parsedWidth > 0 && parsedWidth <= 2000 {
+			params.width = parsedWidth
+		}
+	}
+
+	return params
+}
+
+// validateNoteIDAndGetClipPath validates the note ID parameter and retrieves the clip path.
+// Returns the noteID and clipPath, or an error if validation fails.
+func (c *Controller) validateNoteIDAndGetClipPath(ctx echo.Context) (noteID, clipPath string, err error) {
+	noteID = ctx.Param("id")
 	if noteID == "" {
 		if c.apiLogger != nil {
 			c.apiLogger.Error("Missing note ID for spectrogram request",
 				"path", ctx.Request().URL.Path,
 				"ip", ctx.RealIP())
 		}
-		return c.HandleError(ctx, fmt.Errorf("missing ID"), "Note ID is required", http.StatusBadRequest)
+		err = c.HandleError(ctx, fmt.Errorf("missing ID"), "Note ID is required", http.StatusBadRequest)
+		return
 	}
 
-	if c.apiLogger != nil {
-		c.apiLogger.Debug("Spectrogram requested by ID",
-			"note_id", noteID,
-			"query_params", ctx.QueryString(),
-			"path", ctx.Request().URL.Path,
-			"ip", ctx.RealIP())
-	}
-
-	clipPath, err := c.DS.GetNoteClipPath(noteID)
+	clipPath, err = c.DS.GetNoteClipPath(noteID)
 	if err != nil {
 		if c.apiLogger != nil {
 			c.apiLogger.Error("Failed to get clip path from database",
@@ -511,9 +523,11 @@ func (c *Controller) ServeSpectrogramByID(ctx echo.Context) error {
 				"ip", ctx.RealIP())
 		}
 		if errors.Is(err, os.ErrNotExist) || strings.Contains(err.Error(), "not found") {
-			return c.HandleError(ctx, err, "Clip path not found for note ID", http.StatusNotFound)
+			err = c.HandleError(ctx, err, "No audio clip available for this note", http.StatusNotFound)
+			return
 		}
-		return c.HandleError(ctx, err, "Failed to get clip path for note", http.StatusInternalServerError)
+		err = c.HandleError(ctx, err, "Failed to get clip path for note", http.StatusInternalServerError)
+		return
 	}
 
 	if clipPath == "" {
@@ -523,46 +537,96 @@ func (c *Controller) ServeSpectrogramByID(ctx echo.Context) error {
 				"path", ctx.Request().URL.Path,
 				"ip", ctx.RealIP())
 		}
-		return c.HandleError(ctx, fmt.Errorf("no audio file found"), "No audio clip available for this note", http.StatusNotFound)
+		err = c.HandleError(ctx, fmt.Errorf("no audio file found"), "No audio clip available for this note", http.StatusNotFound)
+		return
 	}
 
-	// Parse size parameter
-	width := SpectrogramSizeMd // Default width (md)
-	sizeStr := ctx.QueryParam("size")
-	if sizeStr != "" {
-		if validWidth, ok := spectrogramSizes[sizeStr]; ok {
-			width = validWidth
+	return
+}
+
+// handleUserRequestedMode handles spectrogram serving in user-requested mode.
+// Returns true if the request was handled (either success or error response sent).
+func (c *Controller) handleUserRequestedMode(ctx echo.Context, noteID, clipPath string, params spectrogramParameters) (bool, error) {
+	// Normalize and validate the audio path
+	clipsPrefix := c.Settings.Realtime.Audio.Export.Path
+	normalizedPath := NormalizeClipPath(clipPath, clipsPrefix)
+	relAudioPath, err := c.SFS.ValidateRelativePath(normalizedPath)
+
+	if err == nil {
+		// Build spectrogram path
+		_, _, _, relSpectrogramPath := buildSpectrogramPaths(relAudioPath, params.width, params.raw)
+
+		// Check if spectrogram already exists
+		if _, statErr := c.SFS.StatRel(relSpectrogramPath); statErr == nil {
+			// Spectrogram exists, serve it
+			if c.apiLogger != nil {
+				c.apiLogger.Debug("Serving existing spectrogram in user-requested mode",
+					"note_id", noteID,
+					"spectrogram_path", relSpectrogramPath,
+					"path", ctx.Request().URL.Path,
+					"ip", ctx.RealIP())
+			}
+
+			err = c.SFS.ServeRelativeFile(ctx, relSpectrogramPath)
+			if err != nil {
+				return true, c.translateSecureFSError(ctx, err, "Failed to serve spectrogram image")
+			}
+			return true, nil
 		}
-		// Invalid size parameter falls back to width parameter or default
 	}
 
-	// Legacy width parameter support
-	widthStr := ctx.QueryParam("width")
-	if widthStr != "" && sizeStr == "" {
-		parsedWidth, err := strconv.Atoi(widthStr)
-		if err == nil && parsedWidth > 0 && parsedWidth <= 2000 {
-			width = parsedWidth
-		}
-	}
-
-	// Parse raw spectrogram parameter
-	raw := parseRawParameter(ctx.QueryParam("raw"))
-
+	// Spectrogram doesn't exist in user-requested mode - return 404 with helpful message
 	if c.apiLogger != nil {
-		c.apiLogger.Debug("Spectrogram parameters parsed",
+		c.apiLogger.Debug("Spectrogram not found in user-requested mode",
 			"note_id", noteID,
-			"clip_path", clipPath,
-			"width", width,
-			"raw", raw,
-			"size_param", sizeStr,
-			"width_param", widthStr,
+			"mode", conf.SpectrogramModeUserRequested,
 			"path", ctx.Request().URL.Path,
 			"ip", ctx.RealIP())
 	}
 
-	// Pass the request context for cancellation/timeout
+	return c.returnSpectrogramNotGeneratedError(ctx)
+}
+
+// returnSpectrogramNotGeneratedError returns a standardized 404 response for user-requested mode
+// when a spectrogram hasn't been generated yet.
+func (c *Controller) returnSpectrogramNotGeneratedError(ctx echo.Context) (bool, error) {
+	// Return JSON response with mode information using standard v2 error envelope.
+	// Flow: <img> element's onerror handler triggers -> frontend makes fetch() call to same URL
+	// -> this JSON response is parsed by frontend -> mode field triggers UI to show "Generate" button
+	// Note: The <img> element doesn't parse this JSON; the error handler's fetch() call does.
+	errorResp := NewErrorResponse(
+		fmt.Errorf("spectrogram not generated"),
+		"Spectrogram has not been generated yet. Click 'Generate Spectrogram' to create it.",
+		http.StatusNotFound,
+	)
+
+	// Log the error with structured logging
+	if c.apiLogger != nil {
+		c.apiLogger.Error("Spectrogram not generated",
+			"correlation_id", errorResp.CorrelationID,
+			"mode", conf.SpectrogramModeUserRequested,
+			"path", ctx.Request().URL.Path,
+			"ip", ctx.RealIP())
+	}
+
+	// Return standard error response with mode in data field (API v2 envelope)
+	// Mode is placed in data object to maintain envelope consistency
+	return true, ctx.JSON(http.StatusNotFound, map[string]any{
+		"error":          errorResp.Error,
+		"message":        errorResp.Message,
+		"code":           errorResp.Code,
+		"correlation_id": errorResp.CorrelationID,
+		"data": map[string]any{
+			"mode": conf.SpectrogramModeUserRequested,
+		},
+	})
+}
+
+// handleAutoPreRenderMode handles spectrogram generation and serving in auto/prerender modes.
+func (c *Controller) handleAutoPreRenderMode(ctx echo.Context, noteID, clipPath string, params spectrogramParameters) error {
+	// Auto or prerender mode - generate on-demand if needed
 	generationStart := time.Now()
-	spectrogramPath, err := c.generateSpectrogram(ctx.Request().Context(), clipPath, width, raw)
+	spectrogramPath, err := c.generateSpectrogram(ctx.Request().Context(), clipPath, params.width, params.raw)
 	generationDuration := time.Since(generationStart)
 
 	if err != nil {
@@ -617,6 +681,92 @@ func (c *Controller) ServeSpectrogramByID(ctx echo.Context) error {
 	return nil
 }
 
+// ServeSpectrogramByID serves a spectrogram image based on note ID using SecureFS
+//
+// Route: GET /api/v2/spectrogram/:id
+//
+// Query Parameters:
+//   - size: Spectrogram size - "sm" (400px), "md" (800px), "lg" (1000px), "xl" (1200px)
+//     Default: "md"
+//   - width: Legacy parameter for custom width (1-2000px). Ignored if 'size' is present.
+//   - raw: Whether to generate raw spectrogram without axes/legends
+//     Default: true (for backward compatibility with cached spectrograms)
+//     Accepts: "true", "false", "1", "0", "t", "f", "yes", "no", "on", "off"
+//
+// Response Format:
+// The response format varies based on the spectrogram generation mode setting and availability.
+// Clients MUST check Content-Type header to handle the response correctly.
+//
+// 1. Success - Spectrogram exists (Auto/Prerender Mode or already generated):
+//   - Content-Type: image/png
+//   - Body: Binary PNG image data
+//   - Status: 200 OK
+//
+// 2. Error - User-Requested Mode (spectrogram not generated):
+//   - Content-Type: application/json
+//   - Status: 404 Not Found
+//   - Body (API v2 envelope):
+//     {
+//     "error": "spectrogram not generated",
+//     "message": "Spectrogram has not been generated yet. Click 'Generate Spectrogram' to create it.",
+//     "code": 404,
+//     "correlation_id": "abc12345",
+//     "data": {
+//     "mode": "user-requested"
+//     }
+//     }
+//
+// IMPORTANT: Clients must check Content-Type header to determine response format:
+//   - image/png: Binary image data (display image)
+//   - application/json: Error response (handle error, show generate button if data.mode=user-requested)
+//
+// TODO: Consider adding a dedicated endpoint or format query parameter for cleaner API design:
+//
+//	Option A: GET /api/v2/spectrogram/:id/info - Returns JSON metadata including mode and status
+//	Option B: GET /api/v2/spectrogram/:id?format=json - Explicit format parameter
+//
+// This would eliminate Content-Type-based response type detection and provide a cleaner separation
+// between image serving and metadata/status queries.
+//
+// The raw parameter defaults to true to maintain compatibility with existing cached
+// spectrograms from the old HTMX API which generated raw spectrograms by default.
+func (c *Controller) ServeSpectrogramByID(ctx echo.Context) error {
+	// Validate note ID and get clip path
+	noteID, clipPath, err := c.validateNoteIDAndGetClipPath(ctx)
+	if err != nil {
+		return err // Error already handled and logged
+	}
+
+	// Parse query parameters
+	params := parseSpectrogramParameters(ctx)
+
+	// Log request details
+	if c.apiLogger != nil {
+		c.apiLogger.Debug("Spectrogram requested by ID",
+			"note_id", noteID,
+			"clip_path", clipPath,
+			"width", params.width,
+			"raw", params.raw,
+			"size_param", params.sizeStr,
+			"path", ctx.Request().URL.Path,
+			"ip", ctx.RealIP())
+	}
+
+	// Check spectrogram generation mode
+	spectrogramMode := c.Settings.Realtime.Dashboard.Spectrogram.GetMode()
+
+	// Handle user-requested mode
+	if spectrogramMode == conf.SpectrogramModeUserRequested {
+		handled, err := c.handleUserRequestedMode(ctx, noteID, clipPath, params)
+		if handled {
+			return err
+		}
+	}
+
+	// Handle auto or prerender mode
+	return c.handleAutoPreRenderMode(ctx, noteID, clipPath, params)
+}
+
 // ServeAudioByQueryID serves an audio clip using query parameter for ID
 func (c *Controller) ServeAudioByQueryID(ctx echo.Context) error {
 	noteID := ctx.QueryParam("id")
@@ -651,7 +801,7 @@ func (c *Controller) ServeSpectrogram(ctx echo.Context) error {
 	width := SpectrogramSizeMd // Default width (md)
 	sizeStr := ctx.QueryParam("size")
 	if sizeStr != "" {
-		if validWidth, ok := spectrogramSizes[sizeStr]; ok {
+		if validWidth, err := spectrogram.SizeToPixels(sizeStr); err == nil {
 			width = validWidth
 		}
 		// Invalid size parameter falls back to width parameter or default
@@ -687,10 +837,26 @@ func (c *Controller) ServeSpectrogram(ctx echo.Context) error {
 //
 // Route: GET /api/v2/spectrogram/:id/status
 //
-// Returns:
-//   - status: "not_started", "queued", "generating", "generated", "failed", or "exists"
-//   - queuePosition: Position in generation queue (0 if not queued)
-//   - message: Additional status information
+// Response Format (API v2 envelope):
+//
+//	{
+//	  "data": {
+//	    "status": "not_started|queued|generating|generated|failed|exists",
+//	    "queuePosition": 0,  // Position in queue (0 if not queued)
+//	    "startedAt": "2025-10-20T...",  // When generation started (if in progress)
+//	    "message": "Additional status information"
+//	  },
+//	  "error": "",
+//	  "message": "Status retrieved successfully"
+//	}
+//
+// Status Values:
+//   - "not_started": Spectrogram generation has not been requested
+//   - "queued": Waiting in queue for generation slot
+//   - "generating": Currently being generated
+//   - "generated": Successfully generated (in queue cache)
+//   - "failed": Generation failed
+//   - "exists": Already exists on disk
 func (c *Controller) GetSpectrogramStatus(ctx echo.Context) error {
 	noteID := ctx.Param("id")
 	if noteID == "" {
@@ -703,54 +869,260 @@ func (c *Controller) GetSpectrogramStatus(ctx echo.Context) error {
 		return c.HandleError(ctx, err, "Detection not found", http.StatusNotFound)
 	}
 
-	// Calculate spectrogram parameters from query
-	width := SpectrogramSizeMd // Default
-	sizeStr := ctx.QueryParam("size")
-	if sizeStr != "" {
-		if validWidth, ok := spectrogramSizes[sizeStr]; ok {
-			width = validWidth
-		}
-	}
+	// Parse query parameters using shared helper
+	params := parseSpectrogramParameters(ctx)
 
-	raw := parseRawParameter(ctx.QueryParam("raw"))
-
-	// Build spectrogram key for status lookup
+	// Build spectrogram path and key for status lookup
+	// Must compute relSpectrogramPath BEFORE checking queue to ensure consistent key format
 	audioPath := detection.ClipName
-	spectrogramKey := fmt.Sprintf("%s_%d_%t", audioPath, width, raw)
-
-	// Check queue status first (more volatile state)
-	spectrogramQueueMutex.RLock()
-	status, existsInQueue := spectrogramQueue[spectrogramKey]
-	spectrogramQueueMutex.RUnlock()
-
-	// If it's actively being processed, return that status immediately
-	if existsInQueue {
-		return ctx.JSON(http.StatusOK, status)
-	}
-
-	// Not in queue, check if spectrogram already exists on disk
 	clipsPrefix := c.Settings.Realtime.Audio.Export.Path
 	normalizedPath := NormalizeClipPath(audioPath, clipsPrefix)
 	relAudioPath, err := c.SFS.ValidateRelativePath(normalizedPath)
-	if err == nil {
-		// Build spectrogram path
-		_, _, _, relSpectrogramPath := buildSpectrogramPaths(relAudioPath, width, raw)
+	if err != nil {
+		// Path validation failed - return not_started status
+		return ctx.JSON(http.StatusOK, map[string]any{
+			"data": map[string]any{
+				"status":        spectrogramStatusNotStarted,
+				"queuePosition": 0,
+				"message":       "Invalid audio path",
+			},
+			"error":   "",
+			"message": "Spectrogram generation not started",
+		})
+	}
 
-		// Check if file exists
-		if _, err := c.SFS.StatRel(relSpectrogramPath); err == nil {
-			return ctx.JSON(http.StatusOK, SpectrogramQueueStatus{
-				Status:        spectrogramStatusExists,
-				QueuePosition: 0,
-				Message:       "Spectrogram already exists",
-			})
+	// Build spectrogram path and key
+	_, _, _, relSpectrogramPath := buildSpectrogramPaths(relAudioPath, params.width, params.raw)
+	spectrogramKey := buildSpectrogramKey(relSpectrogramPath, params.width, params.raw)
+
+	// Check queue status first (more volatile state)
+	// Check if it's actively being processed using sync.Map (lock-free)
+	if statusValue, existsInQueue := spectrogramQueue.Load(spectrogramKey); existsInQueue {
+		// Type-safe cast with check
+		status, ok := statusValue.(*SpectrogramQueueStatus)
+		if !ok {
+			getSpectrogramLogger().Error("Invalid queue status type",
+				"key", spectrogramKey,
+				"type", fmt.Sprintf("%T", statusValue))
+			return c.HandleError(ctx, fmt.Errorf("invalid queue status type for key %s", spectrogramKey),
+				"Invalid status data type", http.StatusInternalServerError)
 		}
+		return ctx.JSON(http.StatusOK, map[string]any{
+			"data":    status.Get(), // Thread-safe snapshot
+			"error":   "",
+			"message": "Spectrogram generation status retrieved",
+		})
+	}
+
+	// Not in queue, check if spectrogram already exists on disk
+	// Check if file exists
+	if _, err := c.SFS.StatRel(relSpectrogramPath); err == nil {
+		return ctx.JSON(http.StatusOK, map[string]any{
+			"data": map[string]any{
+				"status":        spectrogramStatusExists,
+				"queuePosition": 0,
+				"message":       "Spectrogram already exists",
+			},
+			"error":   "",
+			"message": "Spectrogram exists on disk",
+		})
 	}
 
 	// Not in queue and doesn't exist on disk
-	return ctx.JSON(http.StatusOK, SpectrogramQueueStatus{
-		Status:        spectrogramStatusNotStarted,
-		QueuePosition: 0,
-		Message:       "Spectrogram generation not started",
+	return ctx.JSON(http.StatusOK, map[string]any{
+		"data": map[string]any{
+			"status":        spectrogramStatusNotStarted,
+			"queuePosition": 0,
+			"message":       "Spectrogram generation not started",
+		},
+		"error":   "",
+		"message": "Spectrogram not yet generated",
+	})
+}
+
+// GenerateSpectrogramByID triggers spectrogram generation for a specific detection
+//
+// Route: POST /api/v2/spectrogram/:id/generate
+//
+// This endpoint is designed for "user-requested" mode where spectrograms are only
+// generated when explicitly requested by the user clicking a button in the UI.
+//
+// Query Parameters:
+//   - size: Spectrogram size - "sm" (400px), "md" (800px), "lg" (1000px), "xl" (1200px)
+//     Default: "md"
+//   - raw: Whether to generate raw spectrogram without axes/legends
+//     Default: true (for backward compatibility)
+//
+// Response Format (API v2 envelope):
+//
+//	{
+//	  "data": {
+//	    "status": "generated",
+//	    "path": "/api/v2/spectrogram/:id?raw=true"
+//	  },
+//	  "error": "",
+//	  "message": "Spectrogram generated successfully"
+//	}
+//
+// HTTP Status Codes:
+//   - 200 OK: Spectrogram generated successfully
+//   - 503 Service Unavailable: Audio file not ready (includes Retry-After header)
+//   - 404 Not Found: Audio file not found
+//   - 408 Request Timeout: Generation timed out
+//   - 500 Internal Server Error: Generation failed
+func (c *Controller) GenerateSpectrogramByID(ctx echo.Context) error {
+	// Validate note ID and get clip path using shared helper
+	noteID, clipPath, err := c.validateNoteIDAndGetClipPath(ctx)
+	if err != nil {
+		return err // Error already handled and logged
+	}
+
+	// Parse query parameters using shared helper
+	params := parseSpectrogramParameters(ctx)
+
+	// Log request details
+	if c.apiLogger != nil {
+		c.apiLogger.Debug("Spectrogram generation requested by user",
+			"note_id", noteID,
+			"clip_path", clipPath,
+			"width", params.width,
+			"raw", params.raw,
+			"size_param", params.sizeStr,
+			"path", ctx.Request().URL.Path,
+			"ip", ctx.RealIP())
+	}
+
+	// Check if spectrogram already exists (fast path)
+	// Also compute spectrogramKey for queue management
+	clipsPrefix := c.Settings.Realtime.Audio.Export.Path
+	normalizedPath := NormalizeClipPath(clipPath, clipsPrefix)
+	relAudioPath, err := c.SFS.ValidateRelativePath(normalizedPath)
+	if err != nil {
+		// Path validation failed - return error immediately before spawning goroutine
+		if c.apiLogger != nil {
+			c.apiLogger.Error("Invalid audio path for spectrogram generation",
+				"note_id", noteID,
+				"clip_path", clipPath,
+				"normalized_path", normalizedPath,
+				"error", err.Error())
+		}
+		return c.HandleError(ctx, err, "Invalid audio path", http.StatusBadRequest)
+	}
+
+	// Build spectrogram paths and key (path is validated at this point)
+	_, _, _, relSpectrogramPath := buildSpectrogramPaths(relAudioPath, params.width, params.raw)
+	spectrogramKey := buildSpectrogramKey(relSpectrogramPath, params.width, params.raw)
+
+	// Check if file already exists on disk
+	if _, err := c.SFS.StatRel(relSpectrogramPath); err == nil {
+		// Already exists, return immediately with generated status
+		queryParams := url.Values{}
+		sizeParam := params.sizeStr
+		if sizeParam == "" {
+			switch params.width {
+			case SpectrogramSizeSm:
+				sizeParam = "sm"
+			case SpectrogramSizeMd:
+				sizeParam = "md"
+			case SpectrogramSizeLg:
+				sizeParam = "lg"
+			case SpectrogramSizeXl:
+				sizeParam = "xl"
+			default:
+				sizeParam = "md"
+			}
+		}
+		queryParams.Set("size", sizeParam)
+		queryParams.Set("raw", strconv.FormatBool(params.raw))
+		spectrogramURL := fmt.Sprintf("/api/v2/spectrogram/%s?%s", url.PathEscape(noteID), queryParams.Encode())
+
+		return ctx.JSON(http.StatusOK, map[string]any{
+			"data": map[string]any{
+				"status": spectrogramStatusExists,
+				"path":   spectrogramURL,
+			},
+			"error":   "",
+			"message": "Spectrogram already exists",
+		})
+	}
+
+	// Check if generation is already in progress (prevents spawning duplicate goroutines)
+	if statusValue, exists := spectrogramQueue.Load(spectrogramKey); exists {
+		if status, ok := statusValue.(*SpectrogramQueueStatus); ok {
+			currentStatus := status.GetStatus()
+			if currentStatus == spectrogramStatusQueued || currentStatus == spectrogramStatusGenerating {
+				return ctx.JSON(http.StatusAccepted, map[string]any{
+					"data":    status.Get(),
+					"error":   "",
+					"message": "Generation already in progress",
+				})
+			}
+		}
+	}
+
+	// Initialize queue status BEFORE spawning goroutine (prevents "not_started" flicker)
+	c.initializeQueueStatus(spectrogramKey)
+
+	// Start async generation in background with proper cleanup and panic recovery
+	// Track goroutine lifecycle for graceful shutdown
+	c.wg.Go(func() {
+		// Ensure cleanup even if panic occurs (prevents memory leaks)
+		defer func() {
+			if r := recover(); r != nil {
+				if c.apiLogger != nil {
+					c.apiLogger.Error("Panic in async spectrogram generation",
+						"note_id", noteID,
+						"panic", r)
+				}
+			}
+		}()
+
+		// Use controller context (respects shutdown signals) with timeout
+		bgCtx, cancel := context.WithTimeout(c.ctx, 5*time.Minute)
+		defer cancel()
+
+		spectrogramPath, err := c.generateSpectrogram(bgCtx, clipPath, params.width, params.raw)
+
+		if err != nil {
+			// Update queue status so polling clients see the failure
+			// Use spectrogramKey computed earlier (if available)
+			if spectrogramKey != "" {
+				c.updateQueueStatus(spectrogramKey, spectrogramStatusFailed, 0, "Generation failed: "+err.Error())
+			}
+
+			if c.apiLogger != nil {
+				c.apiLogger.Error("Async spectrogram generation failed",
+					"note_id", noteID,
+					"clip_path", clipPath,
+					"error", err.Error())
+			}
+		} else if c.apiLogger != nil {
+			c.apiLogger.Info("Async spectrogram generated successfully",
+				"note_id", noteID,
+				"spectrogram_path", spectrogramPath)
+		}
+	})
+
+	// Return 202 Accepted immediately - client should poll status endpoint
+	// If we initialized queue status, return it; otherwise return generic queued response
+	responseData := map[string]any{
+		"status":        spectrogramStatusQueued,
+		"queuePosition": 0,
+		"message":       "Generation queued",
+	}
+
+	if spectrogramKey != "" {
+		if statusValue, exists := spectrogramQueue.Load(spectrogramKey); exists {
+			if status, ok := statusValue.(*SpectrogramQueueStatus); ok {
+				responseData = status.Get()
+			}
+		}
+	}
+
+	return ctx.JSON(http.StatusAccepted, map[string]any{
+		"data":    responseData,
+		"error":   "",
+		"message": "Generation request accepted. Poll /api/v2/spectrogram/:id/status for progress.",
 	})
 }
 
@@ -759,6 +1131,9 @@ func (c *Controller) GetSpectrogramStatus(ctx echo.Context) error {
 // deployment platform for BirdNET-Go. This prevents severe CPU contention and ensures
 // responsive performance on resource-constrained devices.
 const maxConcurrentSpectrograms = 4
+
+// semaphoreAcquireTimeout is the maximum time to wait for a semaphore slot before timing out
+const semaphoreAcquireTimeout = 30 * time.Second
 
 // spectrogramRetryAfterSeconds is the suggested retry delay in seconds for 503 responses
 // when audio files are not yet ready for processing
@@ -769,16 +1144,59 @@ var (
 	spectrogramGroup     singleflight.Group // Prevents duplicate generations
 
 	// Track spectrogram generation queue status
-	spectrogramQueueMutex sync.RWMutex
-	spectrogramQueue      = make(map[string]*SpectrogramQueueStatus)
+	// Using sync.Map for lock-free concurrent access (fixes race condition with multiple browsers)
+	spectrogramQueue sync.Map // map[string]*SpectrogramQueueStatus
 )
 
 // SpectrogramQueueStatus tracks the status of a spectrogram generation request
+// Thread-safe: uses internal mutex to prevent race conditions during concurrent updates
 type SpectrogramQueueStatus struct {
-	Status        string    `json:"status"`        // "queued", "generating", "generated", "failed", "exists", "not_started"
-	QueuePosition int       `json:"queuePosition"` // Position in queue (0 if generating/generated)
-	StartedAt     time.Time `json:"startedAt"`     // When generation started
-	Message       string    `json:"message"`       // Additional status message
+	mu            sync.RWMutex
+	status        string    // "queued", "generating", "generated", "failed", "exists", "not_started"
+	queuePosition int       // Position in queue (0 if generating/generated)
+	startedAt     time.Time // When generation started
+	message       string    // Additional status message
+}
+
+// Update atomically updates all fields
+// Only sets startedAt when transitioning to "generating" state to preserve accurate timing
+func (s *SpectrogramQueueStatus) Update(status string, queuePos int, message string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Capture previous status to detect state transitions
+	previousStatus := s.status
+
+	// Update fields
+	s.status = status
+	s.queuePosition = queuePos
+	s.message = message
+
+	// Only set startedAt when transitioning into "generating" state
+	// This preserves accurate generation start time across multiple updates
+	if status == spectrogramStatusGenerating &&
+		(previousStatus != spectrogramStatusGenerating || s.startedAt.IsZero()) {
+		s.startedAt = time.Now()
+	}
+}
+
+// Get returns a snapshot of the current status (safe for JSON marshaling)
+func (s *SpectrogramQueueStatus) Get() map[string]any {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return map[string]any{
+		"status":        s.status,
+		"queuePosition": s.queuePosition,
+		"startedAt":     s.startedAt,
+		"message":       s.message,
+	}
+}
+
+// GetStatus returns just the status string (thread-safe)
+func (s *SpectrogramQueueStatus) GetStatus() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.status
 }
 
 // Package-level logger for spectrogram generation
@@ -787,6 +1205,20 @@ var (
 	spectrogramLevelVar    = new(slog.LevelVar) // Dynamic level control
 	closeSpectrogramLogger func() error
 )
+
+// getSpectrogramLogger returns the spectrogram logger, ensuring it's never nil
+func getSpectrogramLogger() *slog.Logger {
+	if spectrogramLogger != nil {
+		return spectrogramLogger
+	}
+	// Emergency fallback if logger is somehow nil
+	defaultLogger := slog.Default()
+	if defaultLogger != nil {
+		return defaultLogger
+	}
+	// Ultimate fallback: create emergency logger to stderr (should never happen)
+	return slog.New(slog.NewTextHandler(os.Stderr, nil))
+}
 
 func init() {
 	// Initialize spectrogram generation logger
@@ -805,11 +1237,19 @@ func init() {
 
 	if err != nil || spectrogramLogger == nil {
 		// Fallback to default logger if file logger creation fails
-		spectrogramLogger = slog.Default().With("service", "spectrogram-generation")
+		defaultLogger := slog.Default()
+		if defaultLogger != nil {
+			spectrogramLogger = defaultLogger.With("service", "spectrogram-generation")
+		} else {
+			// Ultimate fallback: create a new logger to stdout
+			spectrogramLogger = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+				Level: spectrogramLevelVar,
+			})).With("service", "spectrogram-generation")
+		}
 		closeSpectrogramLogger = func() error { return nil }
 		// Log the error so we know why the file logger failed
 		if err != nil {
-			spectrogramLogger.Error("Failed to initialize spectrogram generation file logger", "error", err)
+			getSpectrogramLogger().Error("Failed to initialize spectrogram generation file logger", "error", err)
 		}
 	}
 }
@@ -819,10 +1259,10 @@ func UpdateSpectrogramLogLevel(debugEnabled bool) {
 	if spectrogramLevelVar != nil {
 		if debugEnabled {
 			spectrogramLevelVar.Set(slog.LevelDebug)
-			spectrogramLogger.Info("Spectrogram logger set to DEBUG level")
+			getSpectrogramLogger().Info("Spectrogram logger set to DEBUG level")
 		} else {
 			spectrogramLevelVar.Set(slog.LevelInfo)
-			spectrogramLogger.Info("Spectrogram logger set to INFO level")
+			getSpectrogramLogger().Info("Spectrogram logger set to INFO level")
 		}
 	}
 }
@@ -858,6 +1298,13 @@ func buildSpectrogramPaths(relAudioPath string, width int, raw bool) (relBaseFil
 	relSpectrogramPath = filepath.Join(relAudioDir, spectrogramFilename)
 
 	return relBaseFilename, relAudioDir, spectrogramFilename, relSpectrogramPath
+}
+
+// buildSpectrogramKey generates a consistent unique key for spectrogram queue management.
+// This key is used to track generation status across POST /generate and GET /status endpoints.
+// Format: "path:width:raw" (e.g., "clips/2025/01/audio_123.wav:400:true")
+func buildSpectrogramKey(relSpectrogramPath string, width int, raw bool) string {
+	return fmt.Sprintf("%s:%d:%t", relSpectrogramPath, width, raw)
 }
 
 // ffprobeCache provides a unified cache for all FFprobe operations (validation and duration)
@@ -904,7 +1351,7 @@ func (c *Controller) validateSpectrogramInputs(ctx context.Context, absAudioPath
 			entry.fileSize == fileInfo.Size() &&
 			entry.modTime.Equal(fileInfo.ModTime()) {
 			ffprobeCache.RUnlock()
-			spectrogramLogger.Debug("Audio validation cache hit",
+			getSpectrogramLogger().Debug("Audio validation cache hit",
 				"abs_audio_path", absAudioPath,
 				"cache_age_seconds", time.Since(entry.timestamp).Seconds(),
 				"spectrogram_key", spectrogramKey)
@@ -913,7 +1360,7 @@ func (c *Controller) validateSpectrogramInputs(ctx context.Context, absAudioPath
 	}
 	ffprobeCache.RUnlock()
 
-	spectrogramLogger.Debug("Starting audio validation with FFprobe",
+	getSpectrogramLogger().Debug("Starting audio validation with FFprobe",
 		"abs_audio_path", absAudioPath,
 		"spectrogram_key", spectrogramKey)
 
@@ -924,7 +1371,7 @@ func (c *Controller) validateSpectrogramInputs(ctx context.Context, absAudioPath
 	if err != nil {
 		// Context errors should be propagated immediately
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-			spectrogramLogger.Warn("Audio validation canceled or timed out",
+			getSpectrogramLogger().Warn("Audio validation canceled or timed out",
 				"audio_path", audioPath,
 				"abs_audio_path", absAudioPath,
 				"error", err.Error(),
@@ -933,7 +1380,7 @@ func (c *Controller) validateSpectrogramInputs(ctx context.Context, absAudioPath
 			return nil, err
 		}
 		// Other validation errors
-		spectrogramLogger.Error("Audio validation failed with FFprobe",
+		getSpectrogramLogger().Error("Audio validation failed with FFprobe",
 			"audio_path", audioPath,
 			"abs_audio_path", absAudioPath,
 			"error", err.Error(),
@@ -947,7 +1394,7 @@ func (c *Controller) validateSpectrogramInputs(ctx context.Context, absAudioPath
 
 	// Check if the file is ready
 	if !validationResult.IsValid {
-		spectrogramLogger.Info("Audio file not ready for processing, client should retry",
+		getSpectrogramLogger().Info("Audio file not ready for processing, client should retry",
 			"audio_path", audioPath,
 			"abs_audio_path", absAudioPath,
 			"file_size", validationResult.FileSize,
@@ -982,7 +1429,7 @@ func (c *Controller) validateSpectrogramInputs(ctx context.Context, absAudioPath
 		}
 	}
 
-	spectrogramLogger.Debug("Audio file validated successfully with FFprobe",
+	getSpectrogramLogger().Debug("Audio file validated successfully with FFprobe",
 		"audio_path", audioPath,
 		"abs_audio_path", absAudioPath,
 		"duration_seconds", validationResult.Duration,
@@ -1042,7 +1489,7 @@ func getCachedAudioDuration(ctx context.Context, audioPath string) float64 {
 	// Check if file exists and get info
 	fileInfo, err := os.Stat(audioPath)
 	if err != nil {
-		spectrogramLogger.Debug("Failed to stat audio file for duration cache",
+		getSpectrogramLogger().Debug("Failed to stat audio file for duration cache",
 			"audio_path", audioPath,
 			"error", err)
 		return 0
@@ -1058,7 +1505,7 @@ func getCachedAudioDuration(ctx context.Context, audioPath string) float64 {
 			entry.fileSize == fileInfo.Size() &&
 			entry.modTime.Equal(fileInfo.ModTime()) {
 			ffprobeCache.RUnlock()
-			spectrogramLogger.Debug("Audio duration cache hit",
+			getSpectrogramLogger().Debug("Audio duration cache hit",
 				"audio_path", audioPath,
 				"duration", entry.duration,
 				"cache_age_seconds", time.Since(entry.timestamp).Seconds())
@@ -1068,7 +1515,7 @@ func getCachedAudioDuration(ctx context.Context, audioPath string) float64 {
 	ffprobeCache.RUnlock()
 
 	// Cache miss - call FFprobe
-	spectrogramLogger.Debug("Audio duration cache miss, calling FFprobe",
+	getSpectrogramLogger().Debug("Audio duration cache miss, calling FFprobe",
 		"audio_path", audioPath)
 
 	// Use a timeout context to prevent hanging
@@ -1077,7 +1524,7 @@ func getCachedAudioDuration(ctx context.Context, audioPath string) float64 {
 
 	duration, err := myaudio.GetAudioDuration(durationCtx, audioPath)
 	if err != nil {
-		spectrogramLogger.Warn("Failed to get audio duration with ffprobe",
+		getSpectrogramLogger().Warn("Failed to get audio duration with ffprobe",
 			"error", err,
 			"audio_path", audioPath)
 		return 0
@@ -1102,7 +1549,7 @@ func getCachedAudioDuration(ctx context.Context, audioPath string) float64 {
 	}
 	ffprobeCache.Unlock()
 
-	spectrogramLogger.Debug("Audio duration retrieved and cached",
+	getSpectrogramLogger().Debug("Audio duration retrieved and cached",
 		"audio_path", audioPath,
 		"duration", duration)
 
@@ -1155,7 +1602,7 @@ func (c *Controller) normalizeAndValidatePathWithLogger(audioPath string, logger
 
 // checkSpectrogramExists performs fast path check for existing spectrogram
 func (c *Controller) checkSpectrogramExists(relSpectrogramPath, spectrogramKey string, start time.Time) (bool, error) {
-	spectrogramLogger.Debug("Fast path check: checking if spectrogram exists",
+	getSpectrogramLogger().Debug("Fast path check: checking if spectrogram exists",
 		"spectrogram_key", spectrogramKey,
 		"relative_spectrogram_path", relSpectrogramPath)
 
@@ -1164,7 +1611,7 @@ func (c *Controller) checkSpectrogramExists(relSpectrogramPath, spectrogramKey s
 
 	// Try direct filesystem check first (more reliable)
 	if statInfo, err := os.Stat(absSpectrogramPath); err == nil {
-		spectrogramLogger.Debug("Fast path HIT via direct check: spectrogram already exists",
+		getSpectrogramLogger().Debug("Fast path HIT via direct check: spectrogram already exists",
 			"spectrogram_key", spectrogramKey,
 			"abs_path", absSpectrogramPath,
 			"file_size", statInfo.Size(),
@@ -1175,18 +1622,18 @@ func (c *Controller) checkSpectrogramExists(relSpectrogramPath, spectrogramKey s
 
 	// Fallback to SecureFS check (for consistency with security model)
 	if statInfo, err := c.SFS.StatRel(relSpectrogramPath); err == nil {
-		spectrogramLogger.Debug("Fast path HIT via SecureFS: spectrogram already exists",
+		getSpectrogramLogger().Debug("Fast path HIT via SecureFS: spectrogram already exists",
 			"spectrogram_key", spectrogramKey,
 			"file_size", statInfo.Size(),
 			"mod_time", statInfo.ModTime(),
 			"total_duration_ms", time.Since(start).Milliseconds())
 		return true, nil
 	} else if !os.IsNotExist(err) {
-		spectrogramLogger.Debug("Fast path: unexpected error checking existing spectrogram",
+		getSpectrogramLogger().Debug("Fast path: unexpected error checking existing spectrogram",
 			"spectrogram_key", spectrogramKey,
 			"error", err.Error())
 	} else {
-		spectrogramLogger.Debug("Fast path MISS: spectrogram does not exist",
+		getSpectrogramLogger().Debug("Fast path MISS: spectrogram does not exist",
 			"spectrogram_key", spectrogramKey,
 			"abs_path", absSpectrogramPath)
 	}
@@ -1194,36 +1641,38 @@ func (c *Controller) checkSpectrogramExists(relSpectrogramPath, spectrogramKey s
 	return false, nil
 }
 
-// updateQueueStatus updates the spectrogram generation queue status
+// updateQueueStatus updates the spectrogram generation queue status (thread-safe)
 func (c *Controller) updateQueueStatus(spectrogramKey, status string, queuePos int, message string) {
-	spectrogramQueueMutex.Lock()
-	defer spectrogramQueueMutex.Unlock()
-
-	if queueStatus, exists := spectrogramQueue[spectrogramKey]; exists {
-		queueStatus.Status = status
-		queueStatus.QueuePosition = queuePos
-		queueStatus.Message = message
+	// Using sync.Map for lock-free lookups + struct mutex for safe updates
+	if statusValue, exists := spectrogramQueue.Load(spectrogramKey); exists {
+		if queueStatus, ok := statusValue.(*SpectrogramQueueStatus); ok {
+			queueStatus.Update(status, queuePos, message) // Thread-safe update
+		} else {
+			getSpectrogramLogger().Error("Invalid queue status type in update",
+				"key", spectrogramKey,
+				"type", fmt.Sprintf("%T", statusValue))
+		}
 	}
 }
 
 // checkAudioFileExists verifies the audio file exists
 func (c *Controller) checkAudioFileExists(relAudioPath string) error {
-	spectrogramLogger.Debug("Checking if audio file exists",
+	getSpectrogramLogger().Debug("Checking if audio file exists",
 		"relative_audio_path", relAudioPath)
 
 	if audioStat, err := c.SFS.StatRel(relAudioPath); err != nil {
 		if os.IsNotExist(err) {
-			spectrogramLogger.Debug("Audio file does not exist",
+			getSpectrogramLogger().Debug("Audio file does not exist",
 				"relative_audio_path", relAudioPath,
 				"error", err.Error())
 			return fmt.Errorf("%w: %w (path: %s)", ErrAudioFileNotFound, err, relAudioPath)
 		}
-		spectrogramLogger.Debug("Error checking audio file",
+		getSpectrogramLogger().Debug("Error checking audio file",
 			"relative_audio_path", relAudioPath,
 			"error", err.Error())
 		return fmt.Errorf("error checking audio file '%s': %w", relAudioPath, err)
 	} else {
-		spectrogramLogger.Debug("Audio file exists",
+		getSpectrogramLogger().Debug("Audio file exists",
 			"relative_audio_path", relAudioPath,
 			"size_bytes", audioStat.Size(),
 			"mod_time", audioStat.ModTime().Format("2006-01-02 15:04:05"))
@@ -1232,61 +1681,81 @@ func (c *Controller) checkAudioFileExists(relAudioPath string) error {
 }
 
 // initializeQueueStatus initializes the queue tracking for a spectrogram request
+// Optimized to minimize lock hold time - calculation done outside lock, only write is locked
 func (c *Controller) initializeQueueStatus(spectrogramKey string) {
-	spectrogramQueueMutex.Lock()
-	defer spectrogramQueueMutex.Unlock()
-
-	// Calculate queue position - 0 if slot immediately available, otherwise position in queue
-	var queuePosition int
+	// Step 1: Calculate queue position OUTSIDE the lock to minimize contention
 	currentSlotsInUse := len(spectrogramSemaphore)
 
 	// Log current semaphore state for debugging
-	spectrogramLogger.Debug("Checking semaphore availability",
+	getSpectrogramLogger().Debug("Checking semaphore availability",
 		"spectrogram_key", spectrogramKey,
 		"current_slots_in_use", currentSlotsInUse,
 		"max_concurrent", maxConcurrentSpectrograms,
 		"semaphore_full", currentSlotsInUse >= maxConcurrentSpectrograms)
 
+	var queuePosition int
 	if currentSlotsInUse >= maxConcurrentSpectrograms {
-		// All slots are taken, this will be queued
-		// Count how many are already waiting in queue
+		// All slots are taken, need to count waiting requests
+		// Use sync.Map.Range for lock-free iteration
 		waitingCount := 0
-		for _, status := range spectrogramQueue {
-			if status.Status == spectrogramStatusQueued {
-				waitingCount++
+		spectrogramQueue.Range(func(key, value any) bool {
+			if status, ok := value.(*SpectrogramQueueStatus); ok {
+				if status.GetStatus() == spectrogramStatusQueued {
+					waitingCount++
+				}
 			}
-		}
+			return true // continue iteration
+		})
 		queuePosition = waitingCount + 1
 	} else {
 		// Slot is available, will run immediately
 		queuePosition = 0
 	}
 
-	spectrogramQueue[spectrogramKey] = &SpectrogramQueueStatus{
-		Status:        spectrogramStatusQueued,
-		QueuePosition: queuePosition,
-		StartedAt:     time.Now(),
-		Message:       "Waiting for generation slot",
-	}
+	// Step 2: Create and store status in sync.Map (lock-free operation)
+	status := &SpectrogramQueueStatus{}
+	status.Update(spectrogramStatusQueued, queuePosition, "Waiting for generation slot")
+	spectrogramQueue.Store(spectrogramKey, status)
 }
 
 // cleanupQueueStatus removes the queue entry for a spectrogram request
+// Failed statuses are retained briefly (30s) so polling clients can see the error
 func (c *Controller) cleanupQueueStatus(spectrogramKey string) {
-	spectrogramQueueMutex.Lock()
-	defer spectrogramQueueMutex.Unlock()
-	delete(spectrogramQueue, spectrogramKey)
+	// Check if this is a failed status that should be retained temporarily
+	if statusValue, ok := spectrogramQueue.Load(spectrogramKey); ok {
+		if status, ok := statusValue.(*SpectrogramQueueStatus); ok {
+			if status.GetStatus() == spectrogramStatusFailed {
+				// Keep failed status for 30 seconds so clients can poll and see the error
+				// After that, clean it up automatically
+				time.AfterFunc(30*time.Second, func() {
+					spectrogramQueue.Delete(spectrogramKey)
+					getSpectrogramLogger().Debug("Cleaned up failed spectrogram status after TTL",
+						"spectrogram_key", spectrogramKey)
+				})
+				return
+			}
+		}
+	}
+
+	// For non-failed statuses (success, exists, etc.), delete immediately
+	spectrogramQueue.Delete(spectrogramKey)
 }
 
 // acquireSemaphoreSlot acquires a semaphore slot for spectrogram generation
+// With timeout handling to prevent indefinite blocking
 func (c *Controller) acquireSemaphoreSlot(ctx context.Context, spectrogramKey string) error {
 	slotsInUseBeforeAcquire := len(spectrogramSemaphore)
 	availableSlots := maxConcurrentSpectrograms - slotsInUseBeforeAcquire
 
-	spectrogramLogger.Debug("Attempting to acquire semaphore slot",
+	getSpectrogramLogger().Debug("Attempting to acquire semaphore slot",
 		"spectrogram_key", spectrogramKey,
 		"slots_in_use", slotsInUseBeforeAcquire,
 		"slots_available", availableSlots,
 		"max_concurrent", maxConcurrentSpectrograms)
+
+	// Add explicit timeout for semaphore acquisition
+	timeoutCtx, cancel := context.WithTimeout(ctx, semaphoreAcquireTimeout)
+	defer cancel()
 
 	select {
 	case spectrogramSemaphore <- struct{}{}:
@@ -1294,7 +1763,7 @@ func (c *Controller) acquireSemaphoreSlot(ctx context.Context, spectrogramKey st
 		slotsInUseAfterAcquire := len(spectrogramSemaphore)
 		slotsStillAvailable := maxConcurrentSpectrograms - slotsInUseAfterAcquire
 
-		spectrogramLogger.Debug("Semaphore slot acquired successfully",
+		getSpectrogramLogger().Debug("Semaphore slot acquired successfully",
 			"spectrogram_key", spectrogramKey,
 			"slots_now_in_use", slotsInUseAfterAcquire,
 			"slots_still_available", slotsStillAvailable,
@@ -1303,25 +1772,35 @@ func (c *Controller) acquireSemaphoreSlot(ctx context.Context, spectrogramKey st
 		c.updateQueueStatus(spectrogramKey, spectrogramStatusGenerating, 0, "Generating spectrogram")
 		return nil
 
-	case <-ctx.Done():
-		spectrogramLogger.Debug("Context canceled while waiting for semaphore",
+	case <-timeoutCtx.Done():
+		err := timeoutCtx.Err()
+		if err == context.DeadlineExceeded {
+			getSpectrogramLogger().Warn("Timeout waiting for semaphore slot",
+				"spectrogram_key", spectrogramKey,
+				"timeout_seconds", int(semaphoreAcquireTimeout.Seconds()),
+				"slots_in_use", len(spectrogramSemaphore))
+			c.updateQueueStatus(spectrogramKey, spectrogramStatusFailed, 0, "Request timeout - server busy, please retry")
+			return fmt.Errorf("timeout waiting for generation slot: %w", err)
+		}
+
+		getSpectrogramLogger().Debug("Context canceled while waiting for semaphore",
 			"spectrogram_key", spectrogramKey,
-			"error", ctx.Err())
+			"error", err)
 
 		c.updateQueueStatus(spectrogramKey, spectrogramStatusFailed, 0, "Generation canceled")
-		return ctx.Err()
+		return err
 	}
 }
 
 // performSpectrogramGeneration executes the actual spectrogram generation logic
 func (c *Controller) performSpectrogramGeneration(ctx context.Context, relSpectrogramPath, absAudioPath, absSpectrogramPath, spectrogramKey string, width int, raw bool) (any, error) {
 	// Fast path inside the group – now race-free
-	spectrogramLogger.Debug("Inside singleflight group, double-checking if spectrogram exists",
+	getSpectrogramLogger().Debug("Inside singleflight group, double-checking if spectrogram exists",
 		"spectrogram_key", spectrogramKey)
 
 	// Try direct filesystem check first (more reliable)
 	if _, err := os.Stat(absSpectrogramPath); err == nil {
-		spectrogramLogger.Debug("Spectrogram already exists via direct check (race condition avoided)",
+		getSpectrogramLogger().Debug("Spectrogram already exists via direct check (race condition avoided)",
 			"abs_spectrogram_path", absSpectrogramPath,
 			"spectrogram_key", spectrogramKey)
 		return spectrogramStatusExists, nil
@@ -1329,34 +1808,29 @@ func (c *Controller) performSpectrogramGeneration(ctx context.Context, relSpectr
 
 	// Fallback to SecureFS check
 	if _, err := c.SFS.StatRel(relSpectrogramPath); err == nil {
-		spectrogramLogger.Debug("Spectrogram already exists via SecureFS (race condition avoided)",
+		getSpectrogramLogger().Debug("Spectrogram already exists via SecureFS (race condition avoided)",
 			"spectrogram_path", relSpectrogramPath,
 			"spectrogram_key", spectrogramKey)
 		return spectrogramStatusExists, nil
 	} else if !os.IsNotExist(err) {
-		spectrogramLogger.Debug("Error checking existing spectrogram in singleflight",
+		getSpectrogramLogger().Debug("Error checking existing spectrogram in singleflight",
 			"spectrogram_path", relSpectrogramPath,
 			"error", err)
 		return nil, fmt.Errorf("error checking for existing spectrogram '%s': %w", relSpectrogramPath, err)
 	}
 
-	spectrogramLogger.Debug("Starting actual spectrogram generation (file does not exist)",
+	getSpectrogramLogger().Debug("Starting actual spectrogram generation (file does not exist)",
 		"spectrogram_key", spectrogramKey,
 		"abs_audio_path", absAudioPath,
 		"abs_spectrogram_path", absSpectrogramPath,
 		"width", width,
 		"raw", raw,
-		"generator", "sox_with_ffmpeg_fallback")
+		"generator", "shared_generator_with_sox_ffmpeg_fallback")
 
-	// Ensure the output directory exists
-	// Note: We pass the relative path here. ensureOutputDirectory will construct
-	// the absolute path safely within the SecureFS base directory.
-	if err := c.ensureOutputDirectory(relSpectrogramPath); err != nil {
-		return nil, err
-	}
+	// Note: Directory creation is handled by the shared generator
 
 	// Log when we're about to start actual generation
-	spectrogramLogger.Info("Starting SoX/FFmpeg generation",
+	getSpectrogramLogger().Info("Starting SoX/FFmpeg generation",
 		"spectrogram_key", spectrogramKey,
 		"semaphore_slots_in_use", len(spectrogramSemaphore),
 		"max_slots", maxConcurrentSpectrograms)
@@ -1366,7 +1840,7 @@ func (c *Controller) performSpectrogramGeneration(ctx context.Context, relSpectr
 		return nil, err
 	}
 
-	spectrogramLogger.Info("Completed SoX/FFmpeg generation",
+	getSpectrogramLogger().Info("Completed SoX/FFmpeg generation",
 		"spectrogram_key", spectrogramKey,
 		"semaphore_slots_in_use", len(spectrogramSemaphore),
 		"max_slots", maxConcurrentSpectrograms)
@@ -1375,10 +1849,10 @@ func (c *Controller) performSpectrogramGeneration(ctx context.Context, relSpectr
 	// We'll use a direct filesystem check because os.Root may have issues with newly created files
 	// Retry a few times to handle filesystem sync delays
 	var statErr error
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		// Try direct filesystem check first (more reliable for newly created files)
 		if _, err := os.Stat(absSpectrogramPath); err == nil {
-			spectrogramLogger.Debug("Spectrogram verified via direct filesystem check",
+			getSpectrogramLogger().Debug("Spectrogram verified via direct filesystem check",
 				"abs_spectrogram_path", absSpectrogramPath,
 				"attempt", i+1)
 			statErr = nil
@@ -1391,7 +1865,7 @@ func (c *Controller) performSpectrogramGeneration(ctx context.Context, relSpectr
 
 		// If direct check failed, try via SecureFS (may work better after delay)
 		if _, statErr = c.SFS.StatRel(relSpectrogramPath); statErr == nil {
-			spectrogramLogger.Debug("Spectrogram verified via SecureFS",
+			getSpectrogramLogger().Debug("Spectrogram verified via SecureFS",
 				"rel_spectrogram_path", relSpectrogramPath,
 				"attempt", i+1)
 			break
@@ -1405,7 +1879,7 @@ func (c *Controller) performSpectrogramGeneration(ctx context.Context, relSpectr
 		if i < 2 {
 			// Wait a bit for filesystem to sync (50ms, then 100ms)
 			time.Sleep(time.Duration((i+1)*50) * time.Millisecond)
-			spectrogramLogger.Debug("Retrying spectrogram verification",
+			getSpectrogramLogger().Debug("Retrying spectrogram verification",
 				"abs_path", absSpectrogramPath,
 				"rel_path", relSpectrogramPath,
 				"retry_attempt", i+1)
@@ -1415,11 +1889,11 @@ func (c *Controller) performSpectrogramGeneration(ctx context.Context, relSpectr
 	if statErr != nil {
 		// Double-check with direct filesystem access as last resort
 		if _, finalErr := os.Stat(absSpectrogramPath); finalErr == nil {
-			spectrogramLogger.Info("Spectrogram found via final direct check after SecureFS failed",
+			getSpectrogramLogger().Info("Spectrogram found via final direct check after SecureFS failed",
 				"abs_spectrogram_path", absSpectrogramPath)
 			// File exists, continue with success
 		} else {
-			spectrogramLogger.Error("Generated spectrogram missing after successful command",
+			getSpectrogramLogger().Error("Generated spectrogram missing after successful command",
 				"rel_spectrogram_path", relSpectrogramPath,
 				"abs_spectrogram_path", absSpectrogramPath,
 				"securefs_error", statErr,
@@ -1432,120 +1906,48 @@ func (c *Controller) performSpectrogramGeneration(ctx context.Context, relSpectr
 	return spectrogramStatusGenerated, nil
 }
 
-// ensureOutputDirectory creates the output directory if it doesn't exist.
-//
-// SECURITY NOTE: This function uses os.MkdirAll directly instead of c.SFS.MkdirAll
-// for the following reasons:
-//
-//  1. PATH VALIDATION: The relSpectrogramPath has already been validated by SecureFS
-//     earlier in the call chain (in generateSpectrogram via normalizeAndValidatePath).
-//     This ensures the path is within the allowed clips directory.
-//
-//  2. SECUREFS LIMITATION: c.SFS.MkdirAll expects either an absolute path or converts
-//     relative paths using the current working directory. Since our working directory
-//     is not within the clips directory, passing a relative path like "2025/09" would
-//     fail validation when MkdirAll tries to convert it to an absolute path.
-//
-//  3. SAFETY GUARANTEE: We construct absDir by joining c.SFS.BaseDir() (the validated
-//     clips directory) with relDir (derived from an already-validated path). This ensures
-//     we only create directories within the SecureFS sandbox.
-//
-//  4. CONSISTENCY: The actual spectrogram generation (SoX/FFmpeg) uses absolute paths
-//     constructed the same way, so this maintains consistency with the rest of the pipeline.
-//
-// This approach is safe because:
-// - The input path has been pre-validated through SecureFS
-// - We only create directories, never read or write files
-// - The absolute path is constructed within the SecureFS base directory
-// - No user input is directly used without validation
-func (c *Controller) ensureOutputDirectory(relSpectrogramPath string) error {
-	relDir := filepath.Dir(relSpectrogramPath)
-
-	// Construct absolute path within the SecureFS base directory
-	// This is safe because relSpectrogramPath has already been validated
-	absDir := filepath.Join(c.SFS.BaseDir(), relDir)
-
-	// Use os.MkdirAll directly for the reasons documented above
-	if err := os.MkdirAll(absDir, 0o755); err != nil {
-		spectrogramLogger.Error("Failed to create output directory for spectrogram",
-			"rel_dir", relDir,
-			"abs_dir", absDir,
-			"error", err.Error())
-		return fmt.Errorf("failed to create output directory %s: %w", relDir, err)
-	}
-	spectrogramLogger.Debug("Ensured output directory exists",
-		"rel_dir", relDir,
-		"abs_dir", absDir)
-	return nil
-}
-
 // generateWithFallback attempts to generate a spectrogram with SoX, falling back to FFmpeg on failure
 func (c *Controller) generateWithFallback(ctx context.Context, absAudioPath, absSpectrogramPath, spectrogramKey string, width int, raw bool) error {
 	generationStart := time.Now()
 
-	spectrogramLogger.Debug("Attempting SoX spectrogram generation",
+	getSpectrogramLogger().Debug("Starting spectrogram generation via shared generator",
 		"spectrogram_key", spectrogramKey,
-		"abs_audio_path", absAudioPath)
+		"abs_audio_path", absAudioPath,
+		"width", width,
+		"raw", raw)
 
-	if err := createSpectrogramWithSoX(ctx, absAudioPath, absSpectrogramPath, width, raw, c.Settings); err != nil {
-		spectrogramLogger.Debug("SoX generation failed, will try FFmpeg fallback",
-			"spectrogram_key", spectrogramKey,
-			"sox_error", err.Error(),
-			"sox_duration_ms", time.Since(generationStart).Milliseconds(),
-			"abs_audio_path", absAudioPath)
+	// Use shared generator which handles Sox→FFmpeg fallback internally
+	if err := c.spectrogramGenerator.GenerateFromFile(ctx, absAudioPath, absSpectrogramPath, width, raw); err != nil {
+		// Check if this is an expected operational error (context canceled, process killed)
+		// These are normal events during shutdown, timeout, or resource management
+		isOperationalError := errors.Is(err, context.Canceled) ||
+			errors.Is(err, context.DeadlineExceeded) ||
+			strings.Contains(err.Error(), "signal: killed")
 
-		return c.fallbackToFFmpeg(ctx, absAudioPath, absSpectrogramPath, spectrogramKey, width, raw, err, generationStart)
+		if isOperationalError {
+			// Log at Debug level for expected operational events
+			getSpectrogramLogger().Debug("Spectrogram generation canceled or interrupted",
+				"spectrogram_key", spectrogramKey,
+				"error", err.Error(),
+				"duration_ms", time.Since(generationStart).Milliseconds(),
+				"abs_audio_path", absAudioPath,
+				"abs_spectrogram_path", absSpectrogramPath)
+		} else {
+			// Log at Error level for unexpected failures
+			getSpectrogramLogger().Error("Spectrogram generation failed",
+				"spectrogram_key", spectrogramKey,
+				"error", err.Error(),
+				"duration_ms", time.Since(generationStart).Milliseconds(),
+				"abs_audio_path", absAudioPath,
+				"abs_spectrogram_path", absSpectrogramPath)
+		}
+		return err
 	}
 
-	spectrogramLogger.Debug("Spectrogram generation successful using SoX",
+	getSpectrogramLogger().Debug("Spectrogram generation completed via shared generator",
 		"spectrogram_key", spectrogramKey,
 		"abs_audio_path", absAudioPath,
 		"generation_duration_ms", time.Since(generationStart).Milliseconds())
-	return nil
-}
-
-// fallbackToFFmpeg attempts FFmpeg generation when SoX fails
-func (c *Controller) fallbackToFFmpeg(ctx context.Context, absAudioPath, absSpectrogramPath, spectrogramKey string, width int, raw bool, soxErr error, generationStart time.Time) error {
-	fallbackStart := time.Now()
-	spectrogramLogger.Debug("Attempting FFmpeg fallback for spectrogram generation",
-		"spectrogram_key", spectrogramKey,
-		"abs_audio_path", absAudioPath)
-
-	if err := createSpectrogramWithFFmpeg(ctx, absAudioPath, absSpectrogramPath, width, raw, c.Settings); err != nil {
-		spectrogramLogger.Error("Both SoX and FFmpeg generation failed",
-			"spectrogram_key", spectrogramKey,
-			"sox_error", soxErr.Error(),
-			"ffmpeg_error", err.Error(),
-			"sox_duration_ms", fallbackStart.Sub(generationStart).Milliseconds(),
-			"ffmpeg_duration_ms", time.Since(fallbackStart).Milliseconds(),
-			"total_generation_duration_ms", time.Since(generationStart).Milliseconds(),
-			"abs_audio_path", absAudioPath,
-			"abs_spectrogram_path", absSpectrogramPath)
-
-		// Check for context errors specifically (propagate them up)
-		if errors.Is(soxErr, context.DeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) {
-			if errors.Is(soxErr, context.DeadlineExceeded) {
-				return soxErr
-			}
-			return err
-		}
-		if errors.Is(soxErr, context.Canceled) || errors.Is(err, context.Canceled) {
-			if errors.Is(soxErr, context.Canceled) {
-				return soxErr
-			}
-			return err
-		}
-		// Return a combined error for general failures
-		return fmt.Errorf("%w: SoX error: %w, FFmpeg error: %w",
-			ErrSpectrogramGeneration, soxErr, err)
-	}
-
-	spectrogramLogger.Debug("Spectrogram generation successful using FFmpeg fallback",
-		"spectrogram_key", spectrogramKey,
-		"abs_audio_path", absAudioPath,
-		"sox_duration_ms", fallbackStart.Sub(generationStart).Milliseconds(),
-		"ffmpeg_duration_ms", time.Since(fallbackStart).Milliseconds(),
-		"total_generation_duration_ms", time.Since(generationStart).Milliseconds())
 	return nil
 }
 
@@ -1555,7 +1957,7 @@ func (c *Controller) fallbackToFFmpeg(ctx context.Context, absAudioPath, absSpec
 // Optimized: Fast path check happens before expensive audio validation.
 func (c *Controller) generateSpectrogram(ctx context.Context, audioPath string, width int, raw bool) (string, error) {
 	start := time.Now()
-	spectrogramLogger.Debug("Spectrogram generation requested",
+	getSpectrogramLogger().Debug("Spectrogram generation requested",
 		"audio_path", audioPath,
 		"width", width,
 		"raw", raw,
@@ -1570,7 +1972,7 @@ func (c *Controller) generateSpectrogram(ctx context.Context, audioPath string, 
 	// Step 2: Calculate spectrogram paths early (needed for fast path check)
 	relBaseFilename, relAudioDir, spectrogramFilename, relSpectrogramPath := buildSpectrogramPaths(relAudioPath, width, raw)
 
-	spectrogramLogger.Debug("Spectrogram path constructed",
+	getSpectrogramLogger().Debug("Spectrogram path constructed",
 		"audio_path", audioPath,
 		"audio_ext", filepath.Ext(relAudioPath),
 		"base_filename", relBaseFilename,
@@ -1581,7 +1983,7 @@ func (c *Controller) generateSpectrogram(ctx context.Context, audioPath string, 
 		"raw", raw)
 
 	// Generate a unique key for this spectrogram generation request
-	spectrogramKey := fmt.Sprintf("%s:%d:%t", relSpectrogramPath, width, raw)
+	spectrogramKey := buildSpectrogramKey(relSpectrogramPath, width, raw)
 
 	// Step 3: Fast path - Check if spectrogram already exists
 	exists, err := c.checkSpectrogramExists(relSpectrogramPath, spectrogramKey, start)
@@ -1608,7 +2010,7 @@ func (c *Controller) generateSpectrogram(ctx context.Context, audioPath string, 
 	absSpectrogramPath := filepath.Join(c.SFS.BaseDir(), relSpectrogramPath)
 
 	// Step 6: Proceed with generation (spectrogram doesn't exist)
-	spectrogramLogger.Debug("Proceeding with spectrogram generation",
+	getSpectrogramLogger().Debug("Proceeding with spectrogram generation",
 		"spectrogram_key", spectrogramKey,
 		"abs_audio_path", absAudioPath,
 		"abs_spectrogram_path", absSpectrogramPath,
@@ -1622,7 +2024,7 @@ func (c *Controller) generateSpectrogram(ctx context.Context, audioPath string, 
 	defer c.cleanupQueueStatus(spectrogramKey)
 
 	// Use singleflight to prevent duplicate generations; acquire semaphore only for the winner
-	spectrogramLogger.Debug("Starting singleflight generation",
+	getSpectrogramLogger().Debug("Starting singleflight generation",
 		"spectrogram_key", spectrogramKey)
 
 	_, err, _ = spectrogramGroup.Do(spectrogramKey, func() (any, error) {
@@ -1634,7 +2036,7 @@ func (c *Controller) generateSpectrogram(ctx context.Context, audioPath string, 
 			slotsBeforeRelease := len(spectrogramSemaphore)
 			<-spectrogramSemaphore
 			slotsAfterRelease := len(spectrogramSemaphore)
-			spectrogramLogger.Debug("Semaphore slot released",
+			getSpectrogramLogger().Debug("Semaphore slot released",
 				"spectrogram_key", spectrogramKey,
 				"slots_before_release", slotsBeforeRelease,
 				"slots_after_release", slotsAfterRelease,
@@ -1645,14 +2047,14 @@ func (c *Controller) generateSpectrogram(ctx context.Context, audioPath string, 
 	})
 
 	if err != nil {
-		spectrogramLogger.Debug("Spectrogram generation failed",
+		getSpectrogramLogger().Debug("Spectrogram generation failed",
 			"spectrogram_key", spectrogramKey,
 			"error", err.Error(),
 			"total_duration_ms", time.Since(start).Milliseconds())
 		return "", fmt.Errorf("failed to generate spectrogram: %w", err)
 	}
 
-	spectrogramLogger.Debug("Spectrogram generation completed successfully",
+	getSpectrogramLogger().Debug("Spectrogram generation completed successfully",
 		"spectrogram_key", spectrogramKey,
 		"relative_spectrogram_path", relSpectrogramPath,
 		"total_duration_ms", time.Since(start).Milliseconds())
@@ -1661,244 +2063,10 @@ func (c *Controller) generateSpectrogram(ctx context.Context, audioPath string, 
 	return relSpectrogramPath, nil
 }
 
-// --- Spectrogram Generation Helpers ---
-
-// createSpectrogramWithSoX generates a spectrogram using ffmpeg and SoX.
-// Accepts a context for timeout and cancellation.
-// Requires absolute paths for external commands.
-func createSpectrogramWithSoX(ctx context.Context, absAudioClipPath, absSpectrogramPath string, width int, raw bool, settings *conf.Settings) error {
-	start := time.Now()
-	spectrogramLogger.Debug("Starting SoX spectrogram generation",
-		"abs_audio_path", absAudioClipPath,
-		"abs_spectrogram_path", absSpectrogramPath,
-		"width", width,
-		"raw", raw)
-
-	ffmpegBinary := settings.Realtime.Audio.FfmpegPath
-	soxBinary := settings.Realtime.Audio.SoxPath
-
-	// Check if the file extension is supported directly by SoX without needing FFmpeg
-	ext := strings.ToLower(filepath.Ext(absAudioClipPath))
-	ext = strings.TrimPrefix(ext, ".")
-	useFFmpeg := true
-	for _, soxType := range settings.Realtime.Audio.SoxAudioTypes {
-		soxType = strings.TrimPrefix(strings.ToLower(soxType), ".")
-		if ext == soxType {
-			useFFmpeg = false
-			break
-		}
-	}
-
-	// Only check for FFmpeg if we need to use it
-	if useFFmpeg && ffmpegBinary == "" {
-		return ErrFFmpegNotConfigured
-	}
-
-	// SoX is always required
-	if soxBinary == "" {
-		return ErrSoxNotConfigured
-	}
-
-	// Create context with timeout (use the passed-in context as parent)
-	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
-	defer cancel()
-
-	// NOTE: Semaphore is now acquired in generateSpectrogram() to fix double bottleneck
-	// No longer acquiring semaphore here
-
-	heightStr := strconv.Itoa(width / 2)
-	widthStr := strconv.Itoa(width)
-
-	var cmd *exec.Cmd
-	var soxCmd *exec.Cmd
-
-	if useFFmpeg {
-		ffmpegArgs := []string{"-hide_banner", "-i", absAudioClipPath, "-f", "sox", "-"}
-		soxArgs := append([]string{"-t", "sox", "-"}, getSoxSpectrogramArgs(ctx, widthStr, heightStr, absSpectrogramPath, absAudioClipPath, raw)...)
-
-		if runtime.GOOS == "windows" {
-			// #nosec G204 - ffmpegBinary and soxBinary are validated by ValidateToolPath/exec.LookPath
-			cmd = exec.CommandContext(ctx, ffmpegBinary, ffmpegArgs...)
-			// #nosec G204 - soxBinary is validated by exec.LookPath during config initialization
-			soxCmd = exec.CommandContext(ctx, soxBinary, soxArgs...)
-		} else {
-			// #nosec G204 - ffmpegBinary is validated by ValidateToolPath/exec.LookPath
-			cmd = exec.CommandContext(ctx, "nice", append([]string{"-n", "19", ffmpegBinary}, ffmpegArgs...)...)
-			// #nosec G204 - soxBinary is validated by exec.LookPath during config initialization
-			soxCmd = exec.CommandContext(ctx, "nice", append([]string{"-n", "19", soxBinary}, soxArgs...)...)
-		}
-
-		var err error
-		soxCmd.Stdin, err = cmd.StdoutPipe()
-		if err != nil {
-			return fmt.Errorf("error creating pipe: %w", err)
-		}
-
-		var ffmpegOutput, soxOutput bytes.Buffer
-		cmd.Stderr = &ffmpegOutput
-		soxCmd.Stderr = &soxOutput
-
-		runtime.Gosched()
-
-		if err := soxCmd.Start(); err != nil {
-			return fmt.Errorf("error starting SoX command: %w", err)
-		}
-
-		if err := cmd.Run(); err != nil {
-			if killErr := soxCmd.Process.Kill(); killErr != nil {
-				log.Printf("Failed to kill SoX process: %v", killErr)
-			}
-			waitErr := soxCmd.Wait()
-			var additionalInfo string
-			if waitErr != nil && !os.IsNotExist(waitErr) {
-				additionalInfo = fmt.Sprintf("sox wait error: %v", waitErr)
-			}
-			return fmt.Errorf("ffmpeg command failed: %w\nffmpeg output: %s\nsox output: %s\n%s",
-				err, ffmpegOutput.String(), soxOutput.String(), additionalInfo)
-		}
-
-		runtime.Gosched()
-		if err := soxCmd.Wait(); err != nil {
-			return fmt.Errorf("SoX command failed: %w\nffmpeg output: %s\nsox output: %s",
-				err, ffmpegOutput.String(), soxOutput.String())
-		}
-		runtime.Gosched()
-	} else {
-		soxArgs := append([]string{absAudioClipPath}, getSoxSpectrogramArgs(ctx, widthStr, heightStr, absSpectrogramPath, absAudioClipPath, raw)...)
-
-		// Log the full command being executed
-		spectrogramLogger.Debug("Executing SoX command",
-			"sox_binary", soxBinary,
-			"sox_args", soxArgs,
-			"abs_spectrogram_path", absSpectrogramPath)
-
-		if runtime.GOOS == "windows" {
-			// #nosec G204 - soxBinary is validated by exec.LookPath during config initialization
-			soxCmd = exec.CommandContext(ctx, soxBinary, soxArgs...)
-		} else {
-			// #nosec G204 - soxBinary is validated by exec.LookPath during config initialization
-			soxCmd = exec.CommandContext(ctx, "nice", append([]string{"-n", "19", soxBinary}, soxArgs...)...)
-		}
-
-		var soxOutput bytes.Buffer
-		soxCmd.Stderr = &soxOutput
-		soxCmd.Stdout = &soxOutput
-
-		runtime.Gosched()
-		if err := soxCmd.Run(); err != nil {
-			return fmt.Errorf("SoX command failed: %w\nOutput: %s", err, soxOutput.String())
-		}
-		runtime.Gosched()
-	}
-
-	spectrogramLogger.Debug("SoX spectrogram generation completed successfully",
-		"abs_audio_path", absAudioClipPath,
-		"duration_ms", time.Since(start).Milliseconds(),
-		"use_ffmpeg", useFFmpeg)
-
-	// Verification is now done in performSpectrogramGeneration using SecureFS
-	return nil
-}
-
-// getSoxSpectrogramArgs returns the common SoX arguments compatible with old HTMX API.
-func getSoxSpectrogramArgs(ctx context.Context, widthStr, heightStr, absSpectrogramPath, audioPath string, raw bool) []string {
-	const dynamicRange = "100"
-
-	// Get actual audio duration - check cache first
-	duration := getCachedAudioDuration(ctx, audioPath)
-	if duration <= 0 {
-		// Fall back to capture length from settings if we can't get duration
-		captureLength := conf.Setting().Realtime.Audio.Export.Length
-		duration = float64(captureLength)
-	}
-
-	// Convert duration to string, rounding to nearest integer
-	captureLengthStr := strconv.Itoa(int(duration + 0.5))
-
-	args := []string{"-n", "rate", "24k", "spectrogram", "-x", widthStr, "-y", heightStr, "-d", captureLengthStr, "-z", dynamicRange, "-o", absSpectrogramPath}
-
-	// For compatibility with old HTMX API: add -r flag for raw spectrograms (which is now the default)
-	if raw {
-		// Raw mode: no axes, labels, or legends for clean display (old API default behavior)
-		args = append(args, "-r")
-	}
-	// Note: Non-raw spectrograms (with legends) will have axes and legends visible
-	return args
-}
-
-// createSpectrogramWithFFmpeg generates a spectrogram using only ffmpeg.
-// Accepts a context for timeout and cancellation.
-func createSpectrogramWithFFmpeg(ctx context.Context, absAudioClipPath, absSpectrogramPath string, width int, raw bool, settings *conf.Settings) error {
-	start := time.Now()
-	spectrogramLogger.Debug("Starting FFmpeg spectrogram generation",
-		"abs_audio_path", absAudioClipPath,
-		"abs_spectrogram_path", absSpectrogramPath,
-		"width", width,
-		"raw", raw)
-
-	ffmpegBinary := settings.Realtime.Audio.FfmpegPath
-	if ffmpegBinary == "" {
-		return ErrFFmpegNotConfigured
-	}
-
-	// Create context with timeout (use the passed-in context as parent)
-	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
-	defer cancel()
-
-	// NOTE: Semaphore is now acquired in generateSpectrogram() to fix double bottleneck
-	// No longer acquiring semaphore here
-
-	height := width / 2
-	heightStr := strconv.Itoa(height)
-	widthStr := strconv.Itoa(width)
-
-	var filterStr string
-	if raw {
-		// Raw spectrogram without frequency/time axes and legends for clean display (old API default)
-		filterStr = fmt.Sprintf("showspectrumpic=s=%sx%s:legend=0:gain=3:drange=100", widthStr, heightStr)
-	} else {
-		// Standard spectrogram with frequency/time axes and legends for detailed analysis
-		filterStr = fmt.Sprintf("showspectrumpic=s=%sx%s:legend=1:gain=3:drange=100", widthStr, heightStr)
-	}
-
-	ffmpegArgs := []string{
-		"-hide_banner",
-		"-y",
-		"-i", absAudioClipPath,
-		"-lavfi", filterStr,
-		"-frames:v", "1",
-		absSpectrogramPath,
-	}
-
-	var cmd *exec.Cmd
-	if runtime.GOOS == "windows" {
-		// #nosec G204 - ffmpegBinary is validated by ValidateToolPath/exec.LookPath
-		cmd = exec.CommandContext(ctx, ffmpegBinary, ffmpegArgs...)
-	} else {
-		// #nosec G204 - ffmpegBinary is validated by ValidateToolPath/exec.LookPath
-		cmd = exec.CommandContext(ctx, "nice", append([]string{"-n", "19", ffmpegBinary}, ffmpegArgs...)...)
-	}
-
-	var output bytes.Buffer
-	cmd.Stderr = &output
-	cmd.Stdout = &output
-
-	if err := cmd.Run(); err != nil {
-		spectrogramLogger.Debug("FFmpeg spectrogram generation failed",
-			"abs_audio_path", absAudioClipPath,
-			"duration_ms", time.Since(start).Milliseconds(),
-			"error", err.Error(),
-			"output", output.String())
-		return fmt.Errorf("%w: %w (output: %s)", ErrSpectrogramGeneration, err, output.String())
-	}
-
-	spectrogramLogger.Debug("FFmpeg spectrogram generation completed successfully",
-		"abs_audio_path", absAudioClipPath,
-		"duration_ms", time.Since(start).Milliseconds())
-
-	// Verification is now done in performSpectrogramGeneration using SecureFS
-	return nil
-}
+// Note: createSpectrogramWithSoX, getSoxSpectrogramArgs, createSpectrogramWithFFmpeg,
+// waitWithTimeout, and waitWithTimeoutErr have been removed. All spectrogram generation
+// now uses the shared generator from internal/spectrogram/generator.go via
+// c.spectrogramGenerator.GenerateFromFile().
 
 // GetSpeciesImage serves an image for a bird species by scientific name
 func (c *Controller) GetSpeciesImage(ctx echo.Context) error {

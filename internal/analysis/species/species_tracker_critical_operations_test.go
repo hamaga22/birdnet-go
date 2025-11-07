@@ -15,6 +15,7 @@ import (
 
 	"github.com/tphakala/birdnet-go/internal/conf"
 	"github.com/tphakala/birdnet-go/internal/datastore"
+	"github.com/tphakala/birdnet-go/internal/datastore/mocks"
 )
 
 // TestUpdateSpecies_CriticalReliability tests the core species update logic
@@ -174,11 +175,14 @@ func TestUpdateSpecies_CriticalReliability(t *testing.T) {
 			t.Logf("Testing update scenario: %s", tt.description)
 
 			// Create mock datastore
-			ds := &MockSpeciesDatastore{}
-			ds.On("GetNewSpeciesDetections", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-				Return([]datastore.NewSpeciesData{}, nil)
-			ds.On("GetSpeciesFirstDetectionInPeriod", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-				Return([]datastore.NewSpeciesData{}, nil)
+			ds := mocks.NewMockInterface(t)
+			ds.On("GetNewSpeciesDetections", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+				Return([]datastore.NewSpeciesData{}, nil).Maybe()
+			// BG-17: InitFromDatabase loads notification history (optional - only if suppression enabled)
+			ds.On("GetActiveNotificationHistory", mock.AnythingOfType("time.Time")).
+				Return([]datastore.NotificationHistory{}, nil).Maybe()
+			ds.On("GetSpeciesFirstDetectionInPeriod", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+				Return([]datastore.NewSpeciesData{}, nil).Maybe()
 
 			// Create tracker with specified settings
 			settings := &conf.SpeciesTrackingSettings{
@@ -360,11 +364,14 @@ func TestCheckAndResetPeriods_CriticalReliability(t *testing.T) {
 			t.Logf("Testing period reset scenario: %s", tt.description)
 
 			// Create mock datastore
-			ds := &MockSpeciesDatastore{}
-			ds.On("GetNewSpeciesDetections", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-				Return([]datastore.NewSpeciesData{}, nil)
-			ds.On("GetSpeciesFirstDetectionInPeriod", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-				Return([]datastore.NewSpeciesData{}, nil)
+			ds := mocks.NewMockInterface(t)
+			ds.On("GetNewSpeciesDetections", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+				Return([]datastore.NewSpeciesData{}, nil).Maybe()
+			// BG-17: InitFromDatabase loads notification history (optional - only if suppression enabled)
+			ds.On("GetActiveNotificationHistory", mock.AnythingOfType("time.Time")).
+				Return([]datastore.NotificationHistory{}, nil).Maybe()
+			ds.On("GetSpeciesFirstDetectionInPeriod", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+				Return([]datastore.NewSpeciesData{}, nil).Maybe()
 
 			// Create tracker with specified settings
 			settings := &conf.SpeciesTrackingSettings{
@@ -442,11 +449,14 @@ func TestGetBatchSpeciesStatus_CriticalReliability(t *testing.T) {
 	t.Parallel()
 
 	// Create tracker with test data
-	ds := &MockSpeciesDatastore{}
-	ds.On("GetNewSpeciesDetections", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-		Return([]datastore.NewSpeciesData{}, nil)
-	ds.On("GetSpeciesFirstDetectionInPeriod", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-		Return([]datastore.NewSpeciesData{}, nil)
+	ds := mocks.NewMockInterface(t)
+	ds.On("GetNewSpeciesDetections", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return([]datastore.NewSpeciesData{}, nil).Maybe()
+	// BG-17: InitFromDatabase now loads notification history
+	ds.On("GetActiveNotificationHistory", mock.AnythingOfType("time.Time")).
+		Return([]datastore.NotificationHistory{}, nil).Maybe()
+	ds.On("GetSpeciesFirstDetectionInPeriod", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return([]datastore.NewSpeciesData{}, nil).Maybe()
 
 	settings := &conf.SpeciesTrackingSettings{
 		Enabled:              true,
@@ -570,7 +580,7 @@ func TestGetBatchSpeciesStatus_CriticalReliability(t *testing.T) {
 		species := []string{"Species_A", "Species_B", "Species_C"}
 
 		// Run many concurrent batch operations
-		for i := 0; i < concurrentOps; i++ {
+		for i := range concurrentOps {
 			wg.Add(1)
 			go func(id int) {
 				defer wg.Done()
@@ -595,7 +605,7 @@ func TestGetBatchSpeciesStatus_CriticalReliability(t *testing.T) {
 // generateLargeSpeciesList creates a list of species names for testing
 func generateLargeSpeciesList(count int) []string {
 	species := make([]string, count)
-	for i := 0; i < count; i++ {
+	for i := range count {
 		species[i] = fmt.Sprintf("Batch_Test_Species_%04d", i)
 	}
 	return species

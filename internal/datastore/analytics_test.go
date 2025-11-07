@@ -2,6 +2,7 @@
 package datastore
 
 import (
+	"context"
 	"fmt"
 	"testing"
 	"time"
@@ -96,7 +97,7 @@ func TestGetSpeciesSummaryData(t *testing.T) {
 		seedTestData(t, ds)
 
 		// Test without date filters
-		summaries, err := ds.GetSpeciesSummaryData("", "")
+		summaries, err := ds.GetSpeciesSummaryData(context.Background(), "", "")
 		require.NoError(t, err)
 		assert.Len(t, summaries, 3) // 3 unique species
 
@@ -134,7 +135,7 @@ func TestGetSpeciesSummaryData(t *testing.T) {
 		seedTestData(t, ds)
 
 		// Test with start date filter
-		summaries, err := ds.GetSpeciesSummaryData("2024-01-16", "")
+		summaries, err := ds.GetSpeciesSummaryData(context.Background(), "2024-01-16", "")
 		require.NoError(t, err)
 		assert.Len(t, summaries, 2) // Only Blue Jay and Northern Cardinal
 
@@ -149,7 +150,7 @@ func TestGetSpeciesSummaryData(t *testing.T) {
 		seedTestData(t, ds)
 
 		// Test with end date filter
-		summaries, err := ds.GetSpeciesSummaryData("", "2024-01-16")
+		summaries, err := ds.GetSpeciesSummaryData(context.Background(), "", "2024-01-16")
 		require.NoError(t, err)
 		assert.Len(t, summaries, 2) // American Robin and Blue Jay
 
@@ -164,7 +165,7 @@ func TestGetSpeciesSummaryData(t *testing.T) {
 		seedTestData(t, ds)
 
 		// Test with date range
-		summaries, err := ds.GetSpeciesSummaryData("2024-01-16", "2024-01-16")
+		summaries, err := ds.GetSpeciesSummaryData(context.Background(), "2024-01-16", "2024-01-16")
 		require.NoError(t, err)
 		assert.Len(t, summaries, 1) // Only Blue Jay
 
@@ -178,7 +179,7 @@ func TestGetSpeciesSummaryData(t *testing.T) {
 		ds := setupTestDB(t)
 
 		// Test with empty database
-		summaries, err := ds.GetSpeciesSummaryData("", "")
+		summaries, err := ds.GetSpeciesSummaryData(context.Background(), "", "")
 		require.NoError(t, err)
 		assert.Empty(t, summaries)
 	})
@@ -222,7 +223,7 @@ func TestGetSpeciesSummaryData(t *testing.T) {
 
 		// This query should not fail even with different species_code values
 		// because we're using MAX(species_code) aggregate function
-		summaries, err := ds.GetSpeciesSummaryData("", "")
+		summaries, err := ds.GetSpeciesSummaryData(context.Background(), "", "")
 		require.NoError(t, err, "Query should not fail with SQL aggregate error")
 		assert.Len(t, summaries, 1)
 
@@ -233,6 +234,57 @@ func TestGetSpeciesSummaryData(t *testing.T) {
 		assert.InDelta(t, 0.90, chickadee.MaxConfidence, 0.01)
 		// MAX() should pick one of the species codes
 		assert.Contains(t, []string{"carchi", "carchi2", "carchi3"}, chickadee.SpeciesCode)
+	})
+
+	t.Run("NULL species_code handling", func(t *testing.T) {
+		t.Parallel()
+		ds := setupTestDB(t)
+
+		// Test that NULL species_code values (from birdnet-pi imports) don't break the query
+
+		// Insert a note with NULL species_code using raw SQL to bypass GORM's validation
+		result := ds.DB.Exec(`
+			INSERT INTO notes (date, time, scientific_name, common_name, species_code, confidence)
+			VALUES (?, ?, ?, ?, NULL, ?)
+		`, "2024-01-20", "10:00:00", "Nullus species", "Null Bird", 0.75)
+		require.NoError(t, result.Error)
+
+		// Also insert a normal note with species_code
+		err := ds.DB.Create(&Note{
+			Date:           "2024-01-20",
+			Time:           "11:00:00",
+			ScientificName: "Normal species",
+			CommonName:     "Normal Bird",
+			SpeciesCode:    "norbird",
+			Confidence:     0.85,
+		}).Error
+		require.NoError(t, err)
+
+		// Query should not fail even with NULL species_code
+		summaries, err := ds.GetSpeciesSummaryData(context.Background(), "", "")
+		require.NoError(t, err, "Query should handle NULL species_code without error")
+		require.Len(t, summaries, 2)
+
+		// Find the species with NULL species_code
+		nullSpecies := findSpeciesByScientificName(summaries, "Nullus species")
+		require.NotNil(t, nullSpecies)
+		assert.Equal(t, "Null Bird", nullSpecies.CommonName)
+		assert.Empty(t, nullSpecies.SpeciesCode, "NULL species_code should be converted to empty string")
+		assert.Equal(t, 1, nullSpecies.Count)
+
+		// Also cover NULL common_name
+		result2 := ds.DB.Exec(`
+			INSERT INTO notes (date, time, scientific_name, common_name, species_code, confidence)
+			VALUES (?, ?, ?, NULL, ?, ?)
+		`, "2024-01-21", "10:00:00", "Nullus commonus", "nulcom", 0.66)
+		require.NoError(t, result2.Error)
+
+		summaries2, err := ds.GetSpeciesSummaryData(context.Background(), "", "")
+		require.NoError(t, err)
+		nsCommon := findSpeciesByScientificName(summaries2, "Nullus commonus")
+		require.NotNil(t, nsCommon)
+		assert.Empty(t, nsCommon.CommonName, "NULL common_name should be converted to empty string")
+		assert.Equal(t, "nulcom", nsCommon.SpeciesCode)
 	})
 }
 
@@ -253,7 +305,7 @@ func TestGetSpeciesSummaryDataTimeFormat(t *testing.T) {
 	err := ds.DB.Create(&note).Error
 	require.NoError(t, err)
 
-	summaries, err := ds.GetSpeciesSummaryData("", "")
+	summaries, err := ds.GetSpeciesSummaryData(context.Background(), "", "")
 	require.NoError(t, err)
 	require.Len(t, summaries, 1)
 
@@ -308,7 +360,7 @@ func TestGetNewSpeciesDetections(t *testing.T) {
 		}
 
 		// Test 1: Get new species in July 2024
-		result, err := ds.GetNewSpeciesDetections("2024-07-01", "2024-07-31", 10, 0)
+		result, err := ds.GetNewSpeciesDetections(context.Background(), "2024-07-01", "2024-07-31", 10, 0)
 		require.NoError(t, err)
 		assert.Len(t, result, 2, "Expected 2 new species in July 2024")
 
@@ -336,7 +388,7 @@ func TestGetNewSpeciesDetections(t *testing.T) {
 		ds := setupTestDB(t)
 
 		// Test invalid date range
-		result, err := ds.GetNewSpeciesDetections("2024-07-31", "2024-07-01", 10, 0)
+		result, err := ds.GetNewSpeciesDetections(context.Background(), "2024-07-31", "2024-07-01", 10, 0)
 		require.Error(t, err, "Expected error for invalid date range")
 		assert.Contains(t, err.Error(), "start date cannot be after end date")
 		assert.Nil(t, result)
@@ -360,12 +412,12 @@ func TestGetNewSpeciesDetections(t *testing.T) {
 		}
 
 		// Test with limit
-		result, err := ds.GetNewSpeciesDetections("2024-07-01", "2024-07-31", 2, 0)
+		result, err := ds.GetNewSpeciesDetections(context.Background(), "2024-07-01", "2024-07-31", 2, 0)
 		require.NoError(t, err)
 		assert.Len(t, result, 2, "Expected 2 results with limit=2")
 
 		// Test with offset
-		result2, err := ds.GetNewSpeciesDetections("2024-07-01", "2024-07-31", 2, 2)
+		result2, err := ds.GetNewSpeciesDetections(context.Background(), "2024-07-01", "2024-07-31", 2, 2)
 		require.NoError(t, err)
 		assert.Len(t, result2, 2, "Expected 2 results with limit=2, offset=2")
 
@@ -388,7 +440,7 @@ func TestGetNewSpeciesDetections(t *testing.T) {
 		require.NoError(t, err)
 
 		// Should only return species with valid dates
-		result, err := ds.GetNewSpeciesDetections("2024-07-01", "2024-07-31", 10, 0)
+		result, err := ds.GetNewSpeciesDetections(context.Background(), "2024-07-01", "2024-07-31", 10, 0)
 		require.NoError(t, err)
 		assert.Len(t, result, 1, "Expected only species with valid dates")
 		assert.Equal(t, "Species valid", result[0].ScientificName)
@@ -411,7 +463,7 @@ func TestGetNewSpeciesDetections(t *testing.T) {
 		}
 
 		// Query for new species in 2024
-		result, err := ds.GetNewSpeciesDetections("2024-01-01", "2024-12-31", 10, 0)
+		result, err := ds.GetNewSpeciesDetections(context.Background(), "2024-01-01", "2024-12-31", 10, 0)
 		require.NoError(t, err)
 
 		// Should not find Motacilla alba as new in 2024
@@ -440,12 +492,12 @@ func TestGetNewSpeciesDetections(t *testing.T) {
 		}
 
 		// Test spring period
-		springResult, err := ds.GetNewSpeciesDetections("2024-03-20", "2024-06-20", 10, 0)
+		springResult, err := ds.GetNewSpeciesDetections(context.Background(), "2024-03-20", "2024-06-20", 10, 0)
 		require.NoError(t, err)
 		assert.Len(t, springResult, 2, "Expected 2 new species in spring")
 
 		// Test summer period
-		summerResult, err := ds.GetNewSpeciesDetections("2024-06-21", "2024-09-21", 10, 0)
+		summerResult, err := ds.GetNewSpeciesDetections(context.Background(), "2024-06-21", "2024-09-21", 10, 0)
 		require.NoError(t, err)
 		assert.Len(t, summerResult, 2, "Expected 2 new species in summer")
 
@@ -461,7 +513,7 @@ func TestGetNewSpeciesDetections(t *testing.T) {
 		require.NoError(t, err)
 
 		// Barn Swallow should not be "new" in summer
-		summerResult2, err := ds.GetNewSpeciesDetections("2024-06-21", "2024-09-21", 10, 0)
+		summerResult2, err := ds.GetNewSpeciesDetections(context.Background(), "2024-06-21", "2024-09-21", 10, 0)
 		require.NoError(t, err)
 
 		for _, species := range summerResult2 {
@@ -475,7 +527,7 @@ func TestGetNewSpeciesDetections(t *testing.T) {
 		ds := setupTestDB(t)
 
 		// Multiple detections of same species
-		for i := 0; i < 5; i++ {
+		for i := range 5 {
 			note := Note{
 				Date:           "2024-07-20",
 				Time:           fmt.Sprintf("%02d:00:00", 10+i),
@@ -487,7 +539,7 @@ func TestGetNewSpeciesDetections(t *testing.T) {
 			require.NoError(t, err)
 		}
 
-		result, err := ds.GetNewSpeciesDetections("2024-07-20", "2024-07-20", 10, 0)
+		result, err := ds.GetNewSpeciesDetections(context.Background(), "2024-07-20", "2024-07-20", 10, 0)
 		require.NoError(t, err)
 		assert.Len(t, result, 1, "Expected 1 new species")
 		assert.Equal(t, "2024-07-20", result[0].FirstSeenDate)
@@ -533,7 +585,7 @@ func TestGetHourlyDistribution(t *testing.T) {
 		}
 
 		// Test hourly distribution
-		distribution, err := ds.GetHourlyDistribution("2024-07-15", "2024-07-15", "")
+		distribution, err := ds.GetHourlyDistribution(context.Background(), "2024-07-15", "2024-07-15", "")
 		require.NoError(t, err)
 
 		// Create map for verification
@@ -568,7 +620,7 @@ func TestGetHourlyDistribution(t *testing.T) {
 		}
 
 		// Test with species filter
-		distribution, err := ds.GetHourlyDistribution("2024-07-15", "2024-07-15", "Species A")
+		distribution, err := ds.GetHourlyDistribution(context.Background(), "2024-07-15", "2024-07-15", "Species A")
 		require.NoError(t, err)
 
 		totalCount := 0
@@ -603,14 +655,14 @@ func TestDatabasePerformance(t *testing.T) {
 	detectionsPerSpecies := 50
 	startDate := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
 
-	for i := 0; i < numSpecies; i++ {
+	for i := range numSpecies {
 		scientificName := fmt.Sprintf("Species %03d", i)
 		commonName := fmt.Sprintf("Common Species %03d", i)
 
 		// First detection at different dates
 		firstDetectionDate := startDate.AddDate(0, 0, i)
 
-		for j := 0; j < detectionsPerSpecies; j++ {
+		for j := range detectionsPerSpecies {
 			detectionDate := firstDetectionDate.AddDate(0, 0, j)
 			note := Note{
 				Date:           detectionDate.Format("2006-01-02"),
@@ -626,7 +678,7 @@ func TestDatabasePerformance(t *testing.T) {
 
 	// Measure query performance
 	start := time.Now()
-	result, err := ds.GetNewSpeciesDetections("2024-01-01", "2024-01-31", 50, 0)
+	result, err := ds.GetNewSpeciesDetections(context.Background(), "2024-01-01", "2024-01-31", 50, 0)
 	duration := time.Since(start)
 
 	require.NoError(t, err)
@@ -636,7 +688,7 @@ func TestDatabasePerformance(t *testing.T) {
 	// Test pagination performance
 	start = time.Now()
 	for offset := 0; offset < 30; offset += 10 {
-		_, err := ds.GetNewSpeciesDetections("2024-01-01", "2024-01-31", 10, offset)
+		_, err := ds.GetNewSpeciesDetections(context.Background(), "2024-01-01", "2024-01-31", 10, offset)
 		require.NoError(t, err)
 	}
 	duration = time.Since(start)

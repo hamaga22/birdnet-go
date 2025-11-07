@@ -94,6 +94,12 @@ func setDefaultConfig() {
 	viper.SetDefault("realtime.dashboard.locale", "en") // Default UI locale
 	viper.SetDefault("realtime.dashboard.newui", false) // Enable redirect from old HTMX UI to new Svelte UI
 
+	// Spectrogram pre-rendering configuration
+	viper.SetDefault("realtime.dashboard.spectrogram.enabled", false) // Opt-in for safety
+	viper.SetDefault("realtime.dashboard.spectrogram.mode", "auto")   // Default to auto mode (generate on demand)
+	viper.SetDefault("realtime.dashboard.spectrogram.size", "sm")     // 400px, matches frontend RecentDetectionsCard
+	viper.SetDefault("realtime.dashboard.spectrogram.raw", true)      // Raw spectrogram (no axes/legend)
+
 	// Retention policy configuration
 	viper.SetDefault("realtime.audio.export.retention.enabled", true)
 	viper.SetDefault("realtime.audio.export.retention.debug", false)
@@ -102,6 +108,7 @@ func setDefaultConfig() {
 	viper.SetDefault("realtime.audio.export.retention.maxage", "30d")
 	viper.SetDefault("realtime.audio.export.retention.minclips", 10)
 	viper.SetDefault("realtime.audio.export.retention.keepspectrograms", true)
+	viper.SetDefault("realtime.audio.export.retention.checkinterval", DefaultCleanupCheckInterval)
 
 	// Dynamic threshold configuration
 	viper.SetDefault("realtime.dynamicthreshold.enabled", true)
@@ -109,6 +116,12 @@ func setDefaultConfig() {
 	viper.SetDefault("realtime.dynamicthreshold.trigger", 0.90)
 	viper.SetDefault("realtime.dynamicthreshold.min", 0.20)
 	viper.SetDefault("realtime.dynamicthreshold.validhours", 24)
+
+	// False positive filter configuration
+	// Level 0 = Off (no filtering, backward compatible default)
+	// Level 1 = Lenient, Level 2 = Moderate, Level 3 = Balanced (original behavior)
+	// Level 4 = Strict (RPi 4+ required), Level 5 = Maximum (RPi 4+ required)
+	viper.SetDefault("realtime.falsepositivefilter.level", 0)
 
 	// Log configuration
 	viper.SetDefault("realtime.log.enabled", false)
@@ -314,4 +327,32 @@ func setDefaultConfig() {
 	viper.SetDefault("sentry.dsn", "")
 	viper.SetDefault("sentry.samplerate", 1.0)
 	viper.SetDefault("sentry.debug", false)
+
+	// Notification push configuration
+	viper.SetDefault("notification.push.enabled", false)
+	viper.SetDefault("notification.push.default_timeout", "30s")
+	viper.SetDefault("notification.push.max_retries", 3)
+	viper.SetDefault("notification.push.retry_delay", "5s")
+
+	// Circuit breaker configuration
+	viper.SetDefault("notification.push.circuit_breaker.enabled", true)
+	viper.SetDefault("notification.push.circuit_breaker.max_failures", 5)
+	viper.SetDefault("notification.push.circuit_breaker.timeout", "30s")
+	viper.SetDefault("notification.push.circuit_breaker.half_open_max_requests", 1)
+
+	// Health check configuration
+	viper.SetDefault("notification.push.health_check.enabled", true)
+	viper.SetDefault("notification.push.health_check.interval", "60s")
+	viper.SetDefault("notification.push.health_check.timeout", "10s")
+
+	// Rate limiting configuration
+	viper.SetDefault("notification.push.rate_limiting.enabled", false)
+	viper.SetDefault("notification.push.rate_limiting.requests_per_minute", 60)
+	viper.SetDefault("notification.push.rate_limiting.burst_size", 10)
+
+	viper.SetDefault("notification.push.providers", []map[string]any{})
+
+	// Notification templates
+	viper.SetDefault("notification.templates.newspecies.title", "New Species: {{.CommonName}}")
+	viper.SetDefault("notification.templates.newspecies.message", "{{.ImageURL}}\n\nFirst detection of {{.CommonName}} ({{.ScientificName}}) with {{.ConfidencePercent}}% confidence at {{.DetectionTime}}. \n{{.DetectionURL}}")
 }

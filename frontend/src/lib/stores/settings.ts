@@ -60,8 +60,8 @@ export interface MainSettings {
 }
 
 export interface BirdNetSettings {
-  modelPath: string;
-  labelPath: string;
+  modelPath: string | null;
+  labelPath: string | null;
   sensitivity: number; // 0.0-1.5
   threshold: number; // 0.0-1.0
   overlap: number; // 0.0-2.9
@@ -368,6 +368,7 @@ export interface Dashboard {
   summaryLimit: number;
   locale?: string; // UI locale setting
   newUI?: boolean; // Enable redirect from old HTMX UI to new Svelte UI
+  spectrogram?: SpectrogramPreRender; // Spectrogram pre-rendering settings
 }
 
 export interface Thumbnails {
@@ -377,6 +378,32 @@ export interface Thumbnails {
   imageProvider: string;
   fallbackPolicy: string;
 }
+
+// Spectrogram size options
+export type SpectrogramSize = 'sm' | 'md' | 'lg' | 'xl';
+
+// Spectrogram generation mode options
+export type SpectrogramMode = 'auto' | 'prerender' | 'user-requested';
+
+// SpectrogramPreRender contains settings for spectrogram generation modes.
+// Three modes control when and how spectrograms are generated:
+//   - "auto": Generate on-demand when API is called (default, suitable for most systems)
+//   - "prerender": Background worker generates during audio clip save (continuous CPU usage)
+//   - "user-requested": Only generate when user clicks button in UI (zero automatic overhead)
+export interface SpectrogramPreRender {
+  mode?: SpectrogramMode; // Generation mode (default: 'auto')
+  enabled?: boolean; // DEPRECATED: Use mode instead (kept for backward compatibility)
+  size: SpectrogramSize; // Default size for all modes (sm=400px, md=800px, lg=1000px, xl=1200px)
+  raw: boolean; // Generate raw spectrogram without axes/legend (default: true)
+}
+
+// Default spectrogram settings
+export const DEFAULT_SPECTROGRAM_SETTINGS: SpectrogramPreRender = {
+  mode: 'auto',
+  enabled: false,
+  size: 'sm',
+  raw: true,
+} as const;
 
 // Log config
 export interface LogConfig {
@@ -588,6 +615,7 @@ function createEmptySettings(): SettingsFormData {
         },
         summaryLimit: 100,
         newUI: false,
+        spectrogram: DEFAULT_SPECTROGRAM_SETTINGS,
       },
     },
     webServer: {},
@@ -807,6 +835,16 @@ export const settingsActions = {
             data as Record<string, unknown>
           );
         }
+      }
+
+      // Convert empty strings to null for modelPath and labelPath to signal "revert to default"
+      // This ensures the config file is properly cleaned when users clear these fields
+      // Trim whitespace to handle cases like "   " which should also be treated as empty
+      if (coercedFormData.birdnet.modelPath?.trim() === '') {
+        coercedFormData.birdnet.modelPath = null;
+      }
+      if (coercedFormData.birdnet.labelPath?.trim() === '') {
+        coercedFormData.birdnet.labelPath = null;
       }
 
       await settingsAPI.save(coercedFormData);

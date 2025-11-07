@@ -7,6 +7,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/tphakala/birdnet-go/internal/conf"
+	"github.com/tphakala/birdnet-go/internal/datastore/mocks"
 )
 
 // TestCleanupExpiredCacheComprehensive tests the cleanupExpiredCache method thoroughly
@@ -14,7 +15,7 @@ func TestCleanupExpiredCacheComprehensive(t *testing.T) {
 	t.Parallel()
 
 	t.Run("cleanup with no cache", func(t *testing.T) {
-		ds := &MockSpeciesDatastore{}
+		ds := mocks.NewMockInterface(t)
 		settings := &conf.SpeciesTrackingSettings{
 			Enabled: true,
 		}
@@ -34,7 +35,7 @@ func TestCleanupExpiredCacheComprehensive(t *testing.T) {
 	})
 
 	t.Run("cleanup with expired entries", func(t *testing.T) {
-		ds := &MockSpeciesDatastore{}
+		ds := mocks.NewMockInterface(t)
 		settings := &conf.SpeciesTrackingSettings{
 			Enabled: true,
 		}
@@ -68,7 +69,7 @@ func TestCleanupExpiredCacheComprehensive(t *testing.T) {
 	})
 
 	t.Run("cleanup with LRU eviction", func(t *testing.T) {
-		ds := &MockSpeciesDatastore{}
+		ds := mocks.NewMockInterface(t)
 		settings := &conf.SpeciesTrackingSettings{
 			Enabled: true,
 		}
@@ -78,7 +79,7 @@ func TestCleanupExpiredCacheComprehensive(t *testing.T) {
 
 		now := time.Now()
 		// Add 1500 cache entries (exceeds maxCacheSize of 1000)
-		for i := 0; i < 1500; i++ {
+		for i := range 1500 {
 			species := fmt.Sprintf("species_%d", i)
 			tracker.statusCache[species] = cachedSpeciesStatus{
 				status:    SpeciesStatus{IsNew: i%2 == 0},
@@ -94,7 +95,7 @@ func TestCleanupExpiredCacheComprehensive(t *testing.T) {
 
 		// Verify that newer entries are kept
 		// Species_0 to species_799 should be kept (newest)
-		for i := 0; i < 800; i++ {
+		for i := range 800 {
 			species := fmt.Sprintf("species_%d", i)
 			assert.Contains(t, tracker.statusCache, species, "Newer entry should be kept")
 		}
@@ -107,7 +108,7 @@ func TestCleanupExpiredCacheComprehensive(t *testing.T) {
 	})
 
 	t.Run("cleanup updates lastCacheCleanup", func(t *testing.T) {
-		ds := &MockSpeciesDatastore{}
+		ds := mocks.NewMockInterface(t)
 		settings := &conf.SpeciesTrackingSettings{
 			Enabled: true,
 		}
@@ -129,7 +130,7 @@ func TestCleanupExpiredCacheComprehensive(t *testing.T) {
 	})
 
 	t.Run("cleanup skips if recently cleaned", func(t *testing.T) {
-		ds := &MockSpeciesDatastore{}
+		ds := mocks.NewMockInterface(t)
 		settings := &conf.SpeciesTrackingSettings{
 			Enabled: true,
 		}
@@ -161,7 +162,7 @@ func TestCleanupOldNotificationRecordsLockedComprehensive(t *testing.T) {
 	t.Parallel()
 
 	t.Run("cleanup with no records", func(t *testing.T) {
-		ds := &MockSpeciesDatastore{}
+		ds := mocks.NewMockInterface(t)
 		settings := &conf.SpeciesTrackingSettings{
 			Enabled: true,
 		}
@@ -180,7 +181,7 @@ func TestCleanupOldNotificationRecordsLockedComprehensive(t *testing.T) {
 	})
 
 	t.Run("cleanup removes old records", func(t *testing.T) {
-		ds := &MockSpeciesDatastore{}
+		ds := mocks.NewMockInterface(t)
 		settings := &conf.SpeciesTrackingSettings{
 			Enabled: true,
 		}
@@ -212,7 +213,7 @@ func TestCleanupOldNotificationRecordsLockedComprehensive(t *testing.T) {
 	})
 
 	t.Run("cleanup with custom suppression window", func(t *testing.T) {
-		ds := &MockSpeciesDatastore{}
+		ds := mocks.NewMockInterface(t)
 		settings := &conf.SpeciesTrackingSettings{
 			Enabled: true,
 		}
@@ -242,7 +243,7 @@ func TestCleanupOldNotificationRecordsLockedComprehensive(t *testing.T) {
 	})
 
 	t.Run("cleanup preserves all recent records", func(t *testing.T) {
-		ds := &MockSpeciesDatastore{}
+		ds := mocks.NewMockInterface(t)
 		settings := &conf.SpeciesTrackingSettings{
 			Enabled: true,
 		}
@@ -277,7 +278,7 @@ func TestCheckAndUpdateSpeciesComprehensive(t *testing.T) {
 	t.Parallel()
 
 	t.Run("concurrent updates", func(t *testing.T) {
-		ds := &MockSpeciesDatastore{}
+		ds := mocks.NewMockInterface(t)
 		settings := &conf.SpeciesTrackingSettings{
 			Enabled:              true,
 			NewSpeciesWindowDays: 7,
@@ -289,7 +290,7 @@ func TestCheckAndUpdateSpeciesComprehensive(t *testing.T) {
 		done := make(chan bool, 10)
 		now := time.Now()
 
-		for i := 0; i < 10; i++ {
+		for i := range 10 {
 			go func(id int) {
 				species := fmt.Sprintf("species_%d", id)
 				isNew, days := tracker.CheckAndUpdateSpecies(species, now)
@@ -300,7 +301,7 @@ func TestCheckAndUpdateSpeciesComprehensive(t *testing.T) {
 		}
 
 		// Wait for all goroutines
-		for i := 0; i < 10; i++ {
+		for range 10 {
 			<-done
 		}
 
@@ -311,7 +312,7 @@ func TestCheckAndUpdateSpeciesComprehensive(t *testing.T) {
 	})
 
 	t.Run("updates earlier detection", func(t *testing.T) {
-		ds := &MockSpeciesDatastore{}
+		ds := mocks.NewMockInterface(t)
 		settings := &conf.SpeciesTrackingSettings{
 			Enabled:              true,
 			NewSpeciesWindowDays: 7,
@@ -345,7 +346,7 @@ func TestCacheManagement(t *testing.T) {
 	t.Parallel()
 
 	t.Run("cache hit improves performance", func(t *testing.T) {
-		ds := &MockSpeciesDatastore{}
+		ds := mocks.NewMockInterface(t)
 		settings := &conf.SpeciesTrackingSettings{
 			Enabled: true,
 		}
@@ -373,7 +374,7 @@ func TestCacheManagement(t *testing.T) {
 	})
 
 	t.Run("cache invalidation on update", func(t *testing.T) {
-		ds := &MockSpeciesDatastore{}
+		ds := mocks.NewMockInterface(t)
 		settings := &conf.SpeciesTrackingSettings{
 			Enabled: true,
 		}

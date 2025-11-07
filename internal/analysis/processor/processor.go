@@ -7,7 +7,10 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"os"
+	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,9 +25,15 @@ import (
 	"github.com/tphakala/birdnet-go/internal/imageprovider"
 	"github.com/tphakala/birdnet-go/internal/mqtt"
 	"github.com/tphakala/birdnet-go/internal/myaudio"
+	"github.com/tphakala/birdnet-go/internal/notification"
 	"github.com/tphakala/birdnet-go/internal/observability"
 	"github.com/tphakala/birdnet-go/internal/privacy"
+	"github.com/tphakala/birdnet-go/internal/securefs"
+	"github.com/tphakala/birdnet-go/internal/spectrogram"
 )
+
+// Compile-time assertion to ensure *spectrogram.PreRenderer implements PreRendererSubmit
+var _ PreRendererSubmit = (*spectrogram.PreRenderer)(nil)
 
 // Species identification constants for filtering
 const (
@@ -62,13 +71,17 @@ type Processor struct {
 	controlChan         chan string
 	JobQueue            *jobqueue.JobQueue // Queue for managing job retries
 	workerCancel        context.CancelFunc // Function to cancel worker goroutines
+	thresholdsCtx       context.Context    // Context for threshold persistence/cleanup goroutines
+	thresholdsCancel    context.CancelFunc // Function to cancel threshold persistence/cleanup goroutines
+	preRenderer         PreRendererSubmit  // Spectrogram pre-renderer for background generation
+	preRendererOnce     sync.Once          // Ensures pre-renderer is initialized only once
 	// SSE related fields
 	SSEBroadcaster      func(note *datastore.Note, birdImage *imageprovider.BirdImage) error // Function to broadcast detection via SSE
 	sseBroadcasterMutex sync.RWMutex                                                         // Mutex to protect SSE broadcaster access
 
 	// Backup system fields (optional)
-	backupManager   interface{} // Use interface{} to avoid import cycle
-	backupScheduler interface{} // Use interface{} to avoid import cycle
+	backupManager   any // Use interface{} to avoid import cycle
+	backupScheduler any // Use interface{} to avoid import cycle
 	backupMutex     sync.RWMutex
 
 	// Log deduplication (extracted to separate type for SRP)
@@ -106,6 +119,140 @@ type PendingDetection struct {
 // mutex is used to synchronize access to the PendingDetections map,
 // ensuring thread safety when the map is accessed or modified by concurrent goroutines.
 var mutex sync.Mutex
+
+// suggestLevelForDisabledFilter provides smart recommendations for filter levels
+// when filtering is disabled (level 0). It analyzes current overlap settings
+// and suggests an appropriate filter level that matches the user's configuration.
+func suggestLevelForDisabledFilter(overlap float64) {
+	recommendedLevel, _ := getRecommendedLevelForOverlap(overlap)
+	if recommendedLevel > 0 {
+		GetLogger().Info("False positive filtering is disabled",
+			"current_level", 0,
+			"current_overlap", overlap,
+			"recommended_level", recommendedLevel,
+			"recommended_level_name", getLevelName(recommendedLevel),
+			"recommendation", fmt.Sprintf("Consider enabling filtering with level %d (%s) which matches your current overlap %.1f",
+				recommendedLevel, getLevelName(recommendedLevel), overlap),
+			"operation", "false_positive_filter_config")
+		log.Printf("False positive filtering: DISABLED (level 0)")
+		log.Printf("💡 Suggestion: Your current overlap (%.1f) supports up to Level %d (%s) filtering",
+			overlap, recommendedLevel, getLevelName(recommendedLevel))
+		log.Printf("   Enable filtering to reduce false positives: set realtime.falsepositivefilter.level = %d", recommendedLevel)
+
+		// Notify users through the web UI
+		notification.NotifyInfo(
+			"False Positive Filtering Disabled",
+			fmt.Sprintf("Your system can support Level %d (%s) filtering with your current overlap of %.1f. Enable it in settings to reduce false detections from wind, cars, and other noise.",
+				recommendedLevel, getLevelName(recommendedLevel), overlap),
+		)
+	} else {
+		GetLogger().Info("False positive filtering is disabled",
+			"current_level", 0,
+			"operation", "false_positive_filter_config")
+		log.Printf("False positive filtering: DISABLED (level 0)")
+	}
+}
+
+// validateOverlapForLevel checks if the current overlap is sufficient for the
+// configured filter level and provides warnings/recommendations if not optimal.
+func validateOverlapForLevel(level int, overlap, minOverlap float64, minDetections int) {
+	if overlap < minOverlap {
+		// Overlap is too low for this level
+		GetLogger().Warn("Overlap below recommended minimum for filtering level",
+			"level", level,
+			"level_name", getLevelName(level),
+			"min_overlap", minOverlap,
+			"current_overlap", overlap,
+			"min_detections", minDetections,
+			"hardware_req", getHardwareRequirementForLevel(level),
+			"operation", "false_positive_filter_config")
+		log.Printf("⚠️  False positive filtering: Level %d (%s) - OVERLAP TOO LOW",
+			level, getLevelName(level))
+		log.Printf("   Current overlap: %.1f, Recommended minimum: %.1f", overlap, minOverlap)
+		log.Printf("   Requires %d confirmations in 6 seconds", minDetections)
+		log.Printf("   Hardware: %s", getHardwareRequirementForLevel(level))
+		recommendedForCurrent, _ := getRecommendedLevelForOverlap(overlap)
+		log.Printf("   Consider increasing overlap or using Level %d for your current overlap",
+			recommendedForCurrent)
+
+		// Warn users through the web UI
+		notification.NotifyWarning(
+			"analysis",
+			"Filter Level May Not Work Optimally",
+			fmt.Sprintf("Level %d (%s) filtering requires overlap %.1f or higher, but current overlap is %.1f. Consider increasing overlap to %.1f or using Level %d (%s) instead.",
+				level, getLevelName(level), minOverlap, overlap, minOverlap, recommendedForCurrent, getLevelName(recommendedForCurrent)),
+		)
+	} else {
+		// Configuration is good
+		GetLogger().Info("False positive filtering configured",
+			"level", level,
+			"level_name", getLevelName(level),
+			"overlap", overlap,
+			"min_overlap", minOverlap,
+			"min_detections", minDetections,
+			"hardware_req", getHardwareRequirementForLevel(level),
+			"operation", "false_positive_filter_config")
+		log.Printf("False positive filtering: Level %d (%s)",
+			level, getLevelName(level))
+		log.Printf("  Overlap: %.1f (min required: %.1f) ✓", overlap, minOverlap)
+		log.Printf("  Requires %d confirmations in 6 seconds", minDetections)
+		log.Printf("  Hardware: %s", getHardwareRequirementForLevel(level))
+	}
+}
+
+// warnAboutHardwareRequirements checks if high filter levels (4-5) have
+// sufficient hardware performance based on overlap settings and inference time.
+func warnAboutHardwareRequirements(level int, overlap float64) {
+	if level >= 4 {
+		// Check if overlap is within valid range for calculation
+		if overlap >= 3.0 {
+			GetLogger().Warn("Overlap value too high for hardware calculation",
+				"overlap", overlap,
+				"max_valid", 2.9,
+				"operation", "false_positive_filter_config")
+		} else {
+			stepSize := 3.0 - overlap
+			maxInferenceTime := stepSize * 1000 // Convert to ms
+			GetLogger().Warn("High filtering level requires fast hardware",
+				"level", level,
+				"required_inference_ms", maxInferenceTime,
+				"operation", "false_positive_filter_config")
+			log.Printf("  ⚠️  High level requires fast hardware: inference must complete in < %.0fms", maxInferenceTime)
+		}
+	}
+}
+
+// validateAndLogFilterConfig validates false positive filter configuration,
+// logs appropriate messages, and sends UI notifications. This function handles
+// all validation, logging, and user notification for the false positive filter.
+func validateAndLogFilterConfig(settings *conf.Settings) {
+	// Validate configuration
+	if err := settings.Realtime.FalsePositiveFilter.Validate(); err != nil {
+		GetLogger().Error("Invalid false positive filter configuration",
+			"error", err,
+			"operation", "false_positive_filter_validation")
+		log.Printf("⚠️  Configuration error: %v", err)
+		log.Printf("   Falling back to default: Level 0 (Off)")
+		// Reset to safe default
+		settings.Realtime.FalsePositiveFilter.Level = 0
+	}
+
+	level := settings.Realtime.FalsePositiveFilter.Level
+	overlap := settings.BirdNET.Overlap
+	minOverlap := getMinimumOverlapForLevel(level)
+
+	// Calculate what minDetections will be with current settings
+	minDetections := calculateMinDetectionsFromSettings(settings)
+
+	if level == 0 {
+		// Smart migration: suggest a level based on current overlap
+		suggestLevelForDisabledFilter(overlap)
+	} else {
+		// Filtering is enabled - validate overlap and warn about hardware if needed
+		validateOverlapForLevel(level, overlap, minOverlap, minDetections)
+		warnAboutHardwareRequirements(level, overlap)
+	}
+}
 
 // func New(settings *conf.Settings, ds datastore.Interface, bn *birdnet.BirdNET, audioBuffers map[string]*myaudio.AudioBuffer, metrics *observability.Metrics) *Processor {
 func New(settings *conf.Settings, ds datastore.Interface, bn *birdnet.BirdNET, metrics *observability.Metrics, birdImageCache *imageprovider.BirdImageCache) *Processor {
@@ -152,6 +299,28 @@ func New(settings *conf.Settings, ds datastore.Interface, bn *birdnet.BirdNET, m
 		Enabled:             enabled,
 	}
 	p.logDedup = NewLogDeduplicator(logConfig)
+
+	// Validate detection window configuration
+	captureLength := time.Duration(settings.Realtime.Audio.Export.Length) * time.Second
+	preCaptureLength := time.Duration(settings.Realtime.Audio.Export.PreCapture) * time.Second
+	detectionWindow := max(time.Duration(0), captureLength-preCaptureLength)
+
+	// Warn if detection window is very short (may affect overlap-based filtering)
+	minRecommendedWindow := 3 * time.Second
+	if detectionWindow < minRecommendedWindow {
+		GetLogger().Warn("Detection window very short, may affect accuracy",
+			"window_seconds", detectionWindow.Seconds(),
+			"capture_length_seconds", captureLength.Seconds(),
+			"pre_capture_seconds", preCaptureLength.Seconds(),
+			"min_recommended_seconds", minRecommendedWindow.Seconds(),
+			"operation", "config_validation")
+		log.Printf("Warning: Detection window (%v) is very short, may affect overlap-based filtering accuracy. "+
+			"Minimum recommended: %v (capture_length=%v, pre_capture=%v)",
+			detectionWindow, minRecommendedWindow, captureLength, preCaptureLength)
+	}
+
+	// Validate and log false positive filter configuration
+	validateAndLogFilterConfig(settings)
 
 	// Initialize new species tracker if enabled
 	if settings.Realtime.SpeciesTracking.Enabled {
@@ -233,6 +402,28 @@ func New(settings *conf.Settings, ds datastore.Interface, bn *birdnet.BirdNET, m
 	// Start the job queue
 	p.JobQueue.Start()
 
+	// Load persisted dynamic thresholds from database if enabled
+	if settings.Realtime.DynamicThreshold.Enabled {
+		if err := p.loadDynamicThresholdsFromDB(); err != nil {
+			GetLogger().Debug("Starting with fresh dynamic thresholds",
+				"reason", err.Error(),
+				"operation", "load_dynamic_thresholds")
+			// This is normal on first run or if table doesn't exist yet
+			// System will start with fixed thresholds and learn from detections
+		}
+
+		// Start periodic persistence goroutine
+		p.startThresholdPersistence()
+
+		// Start periodic cleanup goroutine
+		p.startThresholdCleanup()
+	}
+
+	// Initialize spectrogram pre-renderer if mode is "prerender"
+	if settings.Realtime.Dashboard.Spectrogram.IsPreRenderEnabled() {
+		p.initPreRenderer()
+	}
+
 	return p
 }
 
@@ -267,6 +458,8 @@ func (p *Processor) processDetections(item birdnet.Results) {
 		"operation", "process_detections_entry")
 
 	// Detection window sets wait time before a detection is considered final and is flushed.
+	// This represents the duration to wait from NOW (detection creation time) before flushing,
+	// allowing overlapping analyses to accumulate confirmations for false positive filtering.
 	captureLength := time.Duration(p.Settings.Realtime.Audio.Export.Length) * time.Second
 	preCaptureLength := time.Duration(p.Settings.Realtime.Audio.Export.PreCapture) * time.Second
 	// Ensure detectionWindow is non-negative to prevent early flushes
@@ -280,7 +473,7 @@ func (p *Processor) processDetections(item birdnet.Results) {
 	// Log processing results with deduplication to prevent spam
 	p.logDetectionResults(item.Source.ID, len(item.Results), len(detectionResults))
 
-	for i := 0; i < len(detectionResults); i++ {
+	for i := range detectionResults {
 		detection := detectionResults[i]
 		commonName := strings.ToLower(detection.Note.CommonName)
 		confidence := detection.Note.Confidence
@@ -313,14 +506,16 @@ func (p *Processor) processDetections(item birdnet.Results) {
 				"species", commonName,
 				"confidence", confidence,
 				"source", item.Source.DisplayName,
-				"flush_deadline", item.StartTime.Add(detectionWindow),
+				"flush_deadline", time.Now().Add(detectionWindow),
 				"operation", "create_pending_detection")
 			p.pendingDetections[commonName] = PendingDetection{
 				Detection:     detection,
 				Confidence:    confidence,
 				Source:        item.Source.ID,
 				FirstDetected: item.StartTime,
-				FlushDeadline: item.StartTime.Add(detectionWindow),
+				// FlushDeadline is relative to NOW (not startTime) to ensure it's always in the future.
+				// startTime is backdated for audio extraction, but FlushDeadline needs to be a future deadline.
+				FlushDeadline: time.Now().Add(detectionWindow),
 				Count:         1,
 			}
 		}
@@ -752,16 +947,114 @@ func (p *Processor) processApprovedDetection(item *PendingDetection, speciesName
 	}
 }
 
+// calculateMinDetections computes the minimum number of required detections based on
+// the overlap setting and false positive filter level to filter false positives through
+// repeated detection confirmation.
+//
+// The overlap determines how frequently the same audio content is analyzed:
+//   - With overlap 2.0: step size = 1.0s, so a 3-second chunk is analyzed ~3 times
+//   - With overlap 2.5: step size = 0.5s, so a 3-second chunk is analyzed ~6 times
+//
+// A real bird call should be detected consistently across these overlapping analyses,
+// while false positives (noise, wind) are random and won't repeat reliably.
+//
+// The function calculates:
+//  1. How many times audio can be analyzed within a 6-second bird vocalization window
+//  2. Requires a percentage of those analyses to detect the same species (based on level)
+//
+// Filtering Levels (0-5):
+//
+//	Level 0: Off (no filtering, 1 detection required)
+//	Level 1: Lenient (20% threshold, ~2 detections)
+//	Level 2: Moderate (30% threshold, ~3 detections)
+//	Level 3: Balanced (50% threshold, ~5 detections - original pre-Sept 2025 behavior)
+//	Level 4: Strict (60% threshold, ~12 detections - requires RPi 4+)
+//	Level 5: Maximum (70% threshold, ~21 detections - requires RPi 4+)
+//
+// Note: Audio clip length (captureLength/preCapture) does NOT affect this calculation.
+// Those settings control saved audio length, not detection sensitivity.
+//
+// Edge cases handled:
+//   - If level is 0: minDetections = 1 (filtering disabled)
+//   - If overlap is 0 (no overlap): minDetections = 1 (no repeated confirmation possible)
+//   - Very high overlap (>2.9): may require many detections at higher levels
+//   - Floating-point precision: epsilon subtraction prevents values like 5.0000003 from ceiling to 6
+//
+// calculateMinDetectionsFromSettings computes minimum detections from settings alone.
+// This is a standalone function that doesn't require a Processor instance.
+func calculateMinDetectionsFromSettings(settings *conf.Settings) int {
+	// BirdNET uses 3-second chunks for analysis
+	const chunkDurationSeconds = 3.0
+	// Bird vocalization reference window - typical duration of a bird call
+	// Used to calculate how many detections are possible within a single vocalization
+	const referenceWindowSeconds = 6.0
+	// Minimum segment length to prevent division by near-zero values
+	const minSegmentLength = 0.1
+	// Small epsilon to prevent floating-point rounding errors in ceil()
+	// Without this, values like 5.0000000003 would ceil to 6 instead of 5
+	const epsilon = 1e-9
+
+	// Get filtering level from settings
+	level := settings.Realtime.FalsePositiveFilter.Level
+	overlap := settings.BirdNET.Overlap
+
+	// Level 0: no filtering
+	if level == 0 {
+		return 1
+	}
+
+	// Validate overlap is within valid range
+	if overlap >= chunkDurationSeconds {
+		GetLogger().Warn("Overlap equals or exceeds chunk duration",
+			"overlap", overlap,
+			"chunk_duration", chunkDurationSeconds,
+			"operation", "calculate_min_detections")
+		// Continue with safe fallback
+	}
+
+	// Validate overlap meets minimum for level (warning only, don't block)
+	minOverlap := getMinimumOverlapForLevel(level)
+	if overlap < minOverlap {
+		GetLogger().Warn("Overlap too low for filtering level",
+			"level", level,
+			"level_name", getLevelName(level),
+			"min_overlap", minOverlap,
+			"current_overlap", overlap,
+			"operation", "calculate_min_detections")
+		// Continue with calculation - system will work but may not achieve target filtering
+	}
+
+	// Calculate segment length (how often we analyze)
+	segmentLength := math.Max(minSegmentLength, chunkDurationSeconds-overlap)
+
+	// How many detections are possible within a 6-second bird vocalization window?
+	maxDetectionsIn6s := referenceWindowSeconds / segmentLength
+
+	// Get threshold percentage for this level
+	threshold := getThresholdForLevel(level)
+
+	// Calculate minimum required detections
+	// Use Ceil to ensure we require at least the threshold percentage
+	// Subtract epsilon before ceiling to handle floating-point precision issues
+	// (e.g., 5.0000000003 becomes 4.9999999993, which correctly ceils to 5)
+	// Always require at least 1 detection
+	required := maxDetectionsIn6s*threshold - epsilon
+	minDetections := int(math.Max(1, math.Ceil(required)))
+
+	return minDetections
+}
+
+// calculateMinDetections is a convenience method that calls calculateMinDetectionsFromSettings
+// with the processor's settings.
+func (p *Processor) calculateMinDetections() int {
+	return calculateMinDetectionsFromSettings(p.Settings)
+}
+
 // pendingDetectionsFlusher runs a goroutine that periodically checks the pending detections
 // and flushes them to the worker queue if their deadline has passed.
 func (p *Processor) pendingDetectionsFlusher() {
-	// Calculate minimum detections based on overlap setting
-	segmentLength := math.Max(0.1, 3.0-p.Settings.BirdNET.Overlap)
-	minDetections := int(math.Max(1, 3/segmentLength))
-
 	// Add structured logging for pending detections flusher startup
 	GetLogger().Info("Starting pending detections flusher",
-		"min_detections", minDetections,
 		"flush_interval_seconds", 1,
 		"operation", "pending_flusher_startup")
 
@@ -769,9 +1062,24 @@ func (p *Processor) pendingDetectionsFlusher() {
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
 
+		// Track last minDetections value to log changes
+		lastMinDetections := -1
+
 		for {
 			<-ticker.C
 			now := time.Now()
+
+			// Recalculate minDetections on each iteration to account for runtime config changes
+			minDetections := p.calculateMinDetections()
+
+			// Log when minDetections changes due to config update
+			if lastMinDetections != -1 && minDetections != lastMinDetections {
+				GetLogger().Info("minDetections updated due to config change",
+					"old_value", lastMinDetections,
+					"new_value", minDetections,
+					"operation", "pending_flusher_config_update")
+			}
+			lastMinDetections = minDetections
 
 			p.pendingMutex.Lock()
 			pendingCount := len(p.pendingDetections)
@@ -793,6 +1101,15 @@ func (p *Processor) pendingDetectionsFlusher() {
 						delete(p.pendingDetections, species)
 						continue
 					}
+
+					// Log when detection is flushed to help debug future timing issues
+					GetLogger().Debug("Flushing detection",
+						"species", species,
+						"source", p.getDisplayNameForSource(item.Source),
+						"deadline_reached", now.After(item.FlushDeadline),
+						"count", item.Count,
+						"required", minDetections,
+						"operation", "flush_detection")
 
 					p.processApprovedDetection(&item, species)
 					delete(p.pendingDetections, species)
@@ -872,8 +1189,8 @@ func (p *Processor) getActionsForItem(detection *Detections) []Action {
 }
 
 // Helper function to parse command parameters
-func parseCommandParams(params []string, detection *Detections) map[string]interface{} {
-	commandParams := make(map[string]interface{})
+func parseCommandParams(params []string, detection *Detections) map[string]any {
+	commandParams := make(map[string]any)
 	for _, param := range params {
 		value := getNoteValueByName(&detection.Note, param)
 		// Check if the parameter is confidence and normalize it
@@ -914,6 +1231,7 @@ func (p *Processor) getDefaultActions(detection *Detections) []Action {
 			EventTracker:      p.GetEventTracker(),
 			NewSpeciesTracker: tracker,
 			processor:         p, // Add processor reference for source name resolution
+			PreRenderer:       p.preRenderer,
 			Note:              detection.Note,
 			Results:           detection.Results,
 			Ds:                p.Ds,
@@ -1027,12 +1345,13 @@ func (p *Processor) getDefaultActions(detection *Detections) []Action {
 	}
 
 	// Check if UpdateRangeFilterAction needs to be executed for the day
-	today := time.Now().Truncate(24 * time.Hour) // Current date with time set to midnight
-	if p.Settings.BirdNET.RangeFilter.LastUpdated.Before(today) {
+	// Use atomic check-and-set to prevent race conditions (see GitHub issue #1357)
+	// This ensures only ONE goroutine will trigger the daily range filter update,
+	// preventing concurrent updates that could cause species list inconsistencies
+	if p.Settings.ShouldUpdateRangeFilterToday() {
 		// Add structured logging
-		GetLogger().Info("Updating species range filter",
-			"last_updated", p.Settings.BirdNET.RangeFilter.LastUpdated,
-			"today", today,
+		GetLogger().Info("Scheduling daily range filter update",
+			"last_updated", p.Settings.GetLastRangeFilterUpdate(),
 			"operation", "update_range_filter")
 		fmt.Println("Updating species range filter")
 		// Add UpdateRangeFilterAction if it hasn't been executed today
@@ -1091,6 +1410,7 @@ func (p *Processor) GetJobQueueStats() jobqueue.JobStatsSnapshot {
 }
 
 // GetBn returns the BirdNET instance
+//
 // Deprecated: Use GetBirdNET instead
 func (p *Processor) GetBn() *birdnet.BirdNET {
 	return p.Bn
@@ -1116,28 +1436,28 @@ func (p *Processor) GetSSEBroadcaster() func(note *datastore.Note, birdImage *im
 }
 
 // SetBackupManager safely sets the backup manager
-func (p *Processor) SetBackupManager(manager interface{}) {
+func (p *Processor) SetBackupManager(manager any) {
 	p.backupMutex.Lock()
 	defer p.backupMutex.Unlock()
 	p.backupManager = manager
 }
 
 // GetBackupManager safely returns the backup manager
-func (p *Processor) GetBackupManager() interface{} {
+func (p *Processor) GetBackupManager() any {
 	p.backupMutex.RLock()
 	defer p.backupMutex.RUnlock()
 	return p.backupManager
 }
 
 // SetBackupScheduler safely sets the backup scheduler
-func (p *Processor) SetBackupScheduler(scheduler interface{}) {
+func (p *Processor) SetBackupScheduler(scheduler any) {
 	p.backupMutex.Lock()
 	defer p.backupMutex.Unlock()
 	p.backupScheduler = scheduler
 }
 
 // GetBackupScheduler safely returns the backup scheduler
-func (p *Processor) GetBackupScheduler() interface{} {
+func (p *Processor) GetBackupScheduler() any {
 	p.backupMutex.RLock()
 	defer p.backupMutex.RUnlock()
 	return p.backupScheduler
@@ -1183,9 +1503,44 @@ func (p *Processor) getDisplayNameForSource(sourceID string) string {
 
 // Shutdown gracefully stops all processor components
 func (p *Processor) Shutdown() error {
+	// Stop threshold persistence and cleanup goroutines first
+	if p.thresholdsCancel != nil {
+		p.thresholdsCancel()
+	}
+
+	// Flush dynamic thresholds to database before shutting down with timeout
+	if p.Settings.Realtime.DynamicThreshold.Enabled {
+		// Use context-based timeout for cleaner cancellation handling
+		ctx, cancel := context.WithTimeout(context.Background(), DefaultFlushTimeout)
+		defer cancel()
+
+		done := make(chan error, 1)
+		go func() {
+			done <- p.FlushDynamicThresholds()
+		}()
+
+		select {
+		case err := <-done:
+			if err != nil {
+				GetLogger().Warn("Failed to flush dynamic thresholds during shutdown",
+					"error", err,
+					"operation", "shutdown_flush_thresholds")
+			}
+		case <-ctx.Done():
+			GetLogger().Warn("Timeout flushing dynamic thresholds during shutdown",
+				"timeout_seconds", int(DefaultFlushTimeout.Seconds()),
+				"operation", "shutdown_flush_thresholds")
+		}
+	}
+
 	// Cancel all worker goroutines
 	if p.workerCancel != nil {
 		p.workerCancel()
+	}
+
+	// Stop the spectrogram pre-renderer
+	if p.preRenderer != nil {
+		p.preRenderer.Stop()
 	}
 
 	// Stop the job queue with a timeout
@@ -1318,17 +1673,37 @@ func (p *Processor) NewWithSpeciesInfo(
 
 // logDetectionResults logs detection processing results using the LogDeduplicator
 // to prevent repetitive logging while maintaining observability.
+//
+// Strategy (BG-18):
+//   - INFO level: Only when filtered_detections_count > 0 (actual detections)
+//   - DEBUG level: Zero-detection cycles (for troubleshooting without log spam)
+//
+// This prevents ~40,000+ identical "filtered_detections_count:0" logs per day
+// while still allowing debug-mode visibility into the detection pipeline.
 func (p *Processor) logDetectionResults(source string, rawCount, filteredCount int) {
 	// Use the LogDeduplicator to determine if we should log
 	shouldLog, reason := p.logDedup.ShouldLog(source, rawCount, filteredCount)
 
 	if shouldLog {
-		GetLogger().Info("Detection processing results",
-			"source", p.getDisplayNameForSource(source),
-			"raw_results_count", rawCount,
-			"filtered_detections_count", filteredCount,
-			"log_reason", reason,
-			"operation", "process_detections_summary")
+		// Only log at INFO level when there are actual filtered detections
+		// This prevents log spam from empty analysis cycles
+		if filteredCount > 0 {
+			GetLogger().Info("Detection processing results",
+				"source", p.getDisplayNameForSource(source),
+				"raw_results_count", rawCount,
+				"filtered_detections_count", filteredCount,
+				"log_reason", reason,
+				"operation", "process_detections_summary")
+		} else {
+			// Log zero-detection cycles at DEBUG level for troubleshooting
+			// without flooding INFO logs with noise
+			GetLogger().Debug("Detection processing results",
+				"source", p.getDisplayNameForSource(source),
+				"raw_results_count", rawCount,
+				"filtered_detections_count", 0,
+				"log_reason", reason,
+				"operation", "process_detections_summary")
+		}
 	}
 }
 
@@ -1374,4 +1749,76 @@ func generateRandomHex(length int) string {
 		hex = hex[:length]
 	}
 	return hex
+}
+
+// initPreRenderer initializes the spectrogram pre-renderer if enabled.
+// This is called during processor initialization if spectrogram pre-rendering is enabled in settings.
+func (p *Processor) initPreRenderer() {
+	p.preRendererOnce.Do(func() {
+		// Validate export path
+		if p.Settings.Realtime.Audio.Export.Path == "" {
+			GetLogger().Error("Export path not configured, disabling pre-rendering",
+				"operation", "prerenderer_init")
+			return
+		}
+
+		// Verify export path exists and is writable
+		if err := os.MkdirAll(p.Settings.Realtime.Audio.Export.Path, 0o755); err != nil {
+			GetLogger().Error("Export path not writable, disabling pre-rendering",
+				"path", p.Settings.Realtime.Audio.Export.Path,
+				"error", err,
+				"operation", "prerenderer_init")
+			return
+		}
+
+		// Validate spectrogram size configuration early using shared validation
+		size := p.Settings.Realtime.Dashboard.Spectrogram.Size
+		validSizesList := spectrogram.GetValidSizes()
+		if !slices.Contains(validSizesList, size) {
+			GetLogger().Error("Invalid spectrogram size, disabling pre-rendering",
+				"size", size,
+				"valid_sizes", validSizesList,
+				"operation", "prerenderer_init")
+			log.Printf("❌ Invalid spectrogram size '%s', pre-rendering disabled. Valid sizes: %v", size, validSizesList)
+			return
+		}
+
+		// Validate Sox binary is configured and exists
+		if p.Settings.Realtime.Audio.SoxPath == "" {
+			GetLogger().Error("Sox binary not configured, disabling pre-rendering",
+				"operation", "prerenderer_init")
+			return
+		}
+		if _, err := exec.LookPath(p.Settings.Realtime.Audio.SoxPath); err != nil {
+			GetLogger().Error("Sox binary not found, disabling pre-rendering",
+				"path", p.Settings.Realtime.Audio.SoxPath,
+				"error", err,
+				"operation", "prerenderer_init")
+			return
+		}
+
+		// Create SecureFS for path validation
+		sfs, err := securefs.New(p.Settings.Realtime.Audio.Export.Path)
+		if err != nil {
+			GetLogger().Error("Failed to create SecureFS for pre-renderer",
+				"error", err,
+				"export_path", p.Settings.Realtime.Audio.Export.Path,
+				"operation", "prerenderer_init")
+			return
+		}
+
+		// Create context for pre-renderer lifecycle (derived from processor's context if available)
+		ctx := context.Background()
+
+		// Create and start pre-renderer
+		pr := spectrogram.NewPreRenderer(ctx, p.Settings, sfs, GetLogger())
+		pr.Start()
+
+		p.preRenderer = pr
+
+		GetLogger().Info("Spectrogram pre-renderer initialized",
+			"size", p.Settings.Realtime.Dashboard.Spectrogram.Size,
+			"raw", p.Settings.Realtime.Dashboard.Spectrogram.Raw,
+			"operation", "prerenderer_init")
+	})
 }

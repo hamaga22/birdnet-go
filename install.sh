@@ -41,6 +41,11 @@ CONFIG_BACKUP_PREFIX="config-backup-"
 # Set secure umask for file creation
 umask 077
 
+# Telemetry diagnostic truncation limits
+MAX_ERROR_LENGTH=500
+MAX_LOG_LENGTH=1000
+MAX_FLAGS_LENGTH=300
+
 # Cleanup trap for temporary files
 cleanup_temp_files() {
     rm -f /tmp/version_history_*.tmp 2>/dev/null
@@ -1157,7 +1162,35 @@ check_network() {
 
     # First do a basic ping test to check general connectivity
     if ! ping -c 1 8.8.8.8 >/dev/null 2>&1; then
-        send_telemetry_event "error" "Network connectivity failed" "error" "step=network_check,error=ping_failed"
+        # Collect detailed network diagnostics
+        local dns_resolv=$(cat /etc/resolv.conf 2>/dev/null | grep -E "^nameserver" | head -3 | tr '\n' ';' || echo "unavailable")
+        local default_route=$(ip route show default 2>/dev/null | head -1 || echo "unavailable")
+        local network_interfaces=$(ip -br addr show 2>/dev/null | grep -v "lo" | tr '\n' ';' || echo "unavailable")
+        local ping_error=$(ping -c 1 -W 2 8.8.8.8 2>&1 || echo "timeout")
+
+        # Try alternative DNS servers to diagnose DNS vs routing issues
+        local cloudflare_ping="failed"
+        local quad9_ping="failed"
+        ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1 && cloudflare_ping="success"
+        ping -c 1 -W 2 9.9.9.9 >/dev/null 2>&1 && quad9_ping="success"
+
+        local diagnostic_json=$(cat <<EOF
+{
+    "test": "ping",
+    "target": "8.8.8.8",
+    "error": "$(echo "$ping_error" | head -1 | sed 's/"/\\"/g')",
+    "dns_servers": "$dns_resolv",
+    "default_route": "$(echo "$default_route" | sed 's/"/\\"/g')",
+    "network_interfaces": "$network_interfaces",
+    "alternative_dns_tests": {
+        "cloudflare_1.1.1.1": "$cloudflare_ping",
+        "quad9_9.9.9.9": "$quad9_ping"
+    }
+}
+EOF
+)
+
+        send_telemetry_event "error" "Network connectivity failed: ping test unsuccessful" "error" "step=network_check,error=ping_failed" "$diagnostic_json"
         print_message "❌ No network connectivity (ping test failed)" "$RED"
         print_message "Please check your internet connection and try again" "$YELLOW"
         exit 1
@@ -1219,10 +1252,52 @@ check_prerequisites() {
             log_message "INFO" "Detected x86_64 architecture, checking for AVX2 support"
             # Check CPU flags for AVX2 (Haswell and newer)
             if ! grep -q "avx2" /proc/cpuinfo; then
-                log_message "ERROR" "CPU requirements not met: AVX2 support required for x86_64"
-                send_telemetry_event "error" "CPU requirements not met" "error" "step=check_prerequisites,error=no_avx2"
-                print_message "❌ Your Intel CPU is too old. BirdNET-Go requires Intel Haswell (2013) or newer CPU with AVX2 support" "$RED"
-                exit 1
+                log_message "WARN" "CPU does not have AVX2 support, user will be prompted"
+
+                # Collect CPU details for diagnostics
+                local cpu_model=$(grep -m1 "model name" /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs || echo "unknown")
+                local cpu_flags=$(grep -m1 "^flags" /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs | head -c "$MAX_FLAGS_LENGTH" || echo "unknown")
+
+                local diagnostic_json=$(cat <<EOF
+{
+    "architecture": "x86_64",
+    "cpu_model": "$(echo "$cpu_model" | sed 's/"/\\"/g')",
+    "required_feature": "avx2",
+    "cpu_flags": "$(echo "$cpu_flags" | sed 's/"/\\"/g')...",
+    "minimum_recommended": "Intel Haswell (2013) or AMD Excavator (2015)",
+    "user_choice": "prompted"
+}
+EOF
+)
+
+                print_message "⚠️  CPU Compatibility Warning" "$YELLOW"
+                print_message "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" "$YELLOW"
+                print_message "Your CPU: $cpu_model" "$NC"
+                print_message "\nYour CPU does not support AVX2 instructions." "$YELLOW"
+                print_message "BirdNET-Go is optimized for Intel Haswell (2013) or newer CPUs." "$YELLOW"
+                print_message "\n⚠️  What this means:" "$YELLOW"
+                print_message "  • The application may not start on systems without AVX2 support" "$YELLOW"
+                print_message "  • TensorFlow Lite cannot load the model without necessary hardware support" "$YELLOW"
+                print_message "  • However, some users have reported success on certain non-AVX2 systems" "$YELLOW"
+                print_message "\n💡 You can try installing anyway, but the application may fail to start." "$NC"
+                print_message "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" "$YELLOW"
+
+                print_message "\n❓ Do you want to proceed with installation anyway? (y/n): " "$YELLOW" "nonewline"
+                read -r -t 60 response || response="n"
+
+                if [[ "$response" =~ ^[Yy]$ ]]; then
+                    log_message "INFO" "User chose to proceed despite missing AVX2 support"
+                    diagnostic_json=$(echo "$diagnostic_json" | sed 's/"user_choice": "prompted"/"user_choice": "proceed_anyway"/')
+                    send_telemetry_event "warning" "Installation proceeding without AVX2 support (user override)" "warning" "step=check_prerequisites,error=no_avx2,user_override=yes" "$diagnostic_json"
+                    print_message "⚠️  Proceeding with installation (unsupported CPU configuration)" "$YELLOW"
+                else
+                    log_message "INFO" "User chose not to proceed without AVX2 support"
+                    diagnostic_json=$(echo "$diagnostic_json" | sed 's/"user_choice": "prompted"/"user_choice": "declined"/')
+                    send_telemetry_event "info" "Installation cancelled: CPU lacks AVX2 support" "info" "step=check_prerequisites,error=no_avx2,user_override=no" "$diagnostic_json"
+                    print_message "❌ Installation cancelled" "$RED"
+                    print_message "\n💡 Consider upgrading to a newer CPU with AVX2 support for best results." "$YELLOW"
+                    exit 1
+                fi
             else
                 log_message "INFO" "CPU architecture check passed: x86_64 with AVX2 support"
                 print_message "✅ Intel CPU architecture and generation check passed" "$GREEN"
@@ -1234,13 +1309,41 @@ check_prerequisites() {
             ;;
         "armv7l"|"armv6l"|"arm")
             log_message "ERROR" "Unsupported architecture: 32-bit ARM detected"
-            send_telemetry_event "error" "Architecture requirements not met" "error" "step=check_prerequisites,error=32bit_arm"
+
+            local cpu_model=$(grep -m1 "model name" /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs || echo "unknown")
+            local cpu_hardware=$(grep -m1 "^Hardware" /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs || echo "unknown")
+
+            local diagnostic_json=$(cat <<EOF
+{
+    "architecture": "$(uname -m)",
+    "cpu_model": "$(echo "$cpu_model" | sed 's/"/\\"/g')",
+    "cpu_hardware": "$(echo "$cpu_hardware" | sed 's/"/\\"/g')",
+    "issue": "32-bit ARM not supported",
+    "required": "64-bit ARM (aarch64/arm64)"
+}
+EOF
+)
+
+            send_telemetry_event "error" "Architecture requirements not met: 32-bit ARM detected" "error" "step=check_prerequisites,error=32bit_arm" "$diagnostic_json"
             print_message "❌ 32-bit ARM architecture detected. BirdNET-Go requires 64-bit ARM processor and OS" "$RED"
             exit 1
             ;;
         *)
             log_message "ERROR" "Unsupported CPU architecture: $(uname -m)"
-            send_telemetry_event "error" "Unsupported CPU architecture" "error" "step=check_prerequisites,error=unsupported_arch,arch=$(uname -m)"
+
+            local cpu_info=$(grep -m1 "model name" /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs || echo "unknown")
+
+            local diagnostic_json=$(cat <<EOF
+{
+    "architecture": "$(uname -m)",
+    "cpu_info": "$(echo "$cpu_info" | sed 's/"/\\"/g')",
+    "supported_architectures": ["x86_64 (with AVX2)", "aarch64", "arm64"],
+    "issue": "unsupported_architecture"
+}
+EOF
+)
+
+            send_telemetry_event "error" "Unsupported CPU architecture: $(uname -m)" "error" "step=check_prerequisites,error=unsupported_arch" "$diagnostic_json"
             print_message "❌ Unsupported CPU architecture: $(uname -m)" "$RED"
             exit 1
             ;;
@@ -1475,8 +1578,39 @@ check_prerequisites() {
         print_message "  • HTTP web interface access" "$YELLOW"
         print_message "  • HTTPS web interface (if SSL is configured)" "$YELLOW"
         print_message "  • Proper web interface functionality" "$YELLOW"
-        
-        send_telemetry_event "error" "Port availability check failed" "error" "step=check_prerequisites,failed_ports=${failed_ports[*]}"
+
+        # Build detailed diagnostic information about port conflicts using jq for safe JSON construction
+        local ports_json
+        ports_json="[]"
+        for i in "${!failed_ports[@]}"; do
+            # Use jq to safely construct each port object (handles newlines, quotes, special chars)
+            local port_obj
+            port_obj=$(jq -n \
+                --arg port "${failed_ports[$i]}" \
+                --arg proc "${port_processes[$i]}" \
+                '{port: ($port | tonumber), process: $proc}')
+            # Append to array
+            ports_json=$(echo "$ports_json" | jq --argjson obj "$port_obj" '. += [$obj]')
+        done
+
+        # Build complete diagnostic JSON safely with jq
+        local diagnostic_json
+        diagnostic_json=$(jq -n \
+            --argjson ports "$ports_json" \
+            --arg web_port "${WEB_PORT:-8080}" \
+            --argjson total "${#failed_ports[@]}" \
+            '{
+                failed_ports: $ports,
+                requested_ports: {
+                    web_port: $web_port,
+                    http: 80,
+                    https: 443,
+                    metrics: 8090
+                },
+                total_conflicts: $total
+            }')
+
+        send_telemetry_event "error" "Port availability check failed: ${#failed_ports[@]} port(s) in use" "error" "step=check_prerequisites" "$diagnostic_json"
         exit 1
     fi
     
@@ -1637,38 +1771,150 @@ collect_system_info() {
     echo "{\"os_name\":\"$os_name\",\"os_version\":\"$os_version\",\"cpu_arch\":\"$cpu_arch\",\"docker_version\":\"$docker_version\",\"pi_model\":\"$pi_model\",\"install_id\":\"$TELEMETRY_INSTALL_ID\"}"
 }
 
+# Helper function to collect CPU diagnostics
+# Returns: JSON object with cpu_model and truncated cpu_flags
+# Note: CPU flags are truncated to MAX_FLAGS_LENGTH to prevent oversized payloads
+collect_cpu_diagnostics() {
+    local cpu_model
+    local cpu_flags
+
+    cpu_model=$(grep -m1 "model name" /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs || echo "unknown")
+    cpu_flags=$(grep -m1 "^flags" /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs | head -c "$MAX_FLAGS_LENGTH" || echo "unknown")
+
+    cat <<EOF
+{
+    "cpu_model": "$(echo "$cpu_model" | sed 's/"/\\"/g')",
+    "cpu_flags": "$(echo "$cpu_flags" | sed 's/"/\\"/g')..."
+}
+EOF
+}
+
+# Helper function to safely truncate text for diagnostics
+# Args:
+#   $1 - text to truncate
+#   $2 - max length (optional, defaults to MAX_ERROR_LENGTH)
+# Returns: Truncated text
+safe_truncate() {
+    local text="$1"
+    local max_length="${2:-$MAX_ERROR_LENGTH}"
+    echo "$text" | head -c "$max_length"
+}
+
+# Helper function to validate JSON before sending to telemetry
+# Args:
+#   $1 - JSON string to validate
+# Returns: Valid JSON or fallback error object
+# Exit codes:
+#   0 - JSON is valid or jq not available (pass-through)
+#   1 - JSON is invalid, fallback returned
+validate_diagnostic_json() {
+    local json="$1"
+
+    # Check if jq is available
+    if command -v jq >/dev/null 2>&1; then
+        if echo "$json" | jq empty 2>/dev/null; then
+            echo "$json"
+            return 0
+        else
+            log_message "WARN" "Invalid diagnostic JSON detected, using fallback"
+            echo '{"error": "diagnostic_collection_failed", "reason": "invalid_json"}'
+            return 1
+        fi
+    else
+        # jq not available, just return the JSON
+        echo "$json"
+        return 0
+    fi
+}
+
+# Helper function to collect Docker pull failure diagnostics
+# Args:
+#   $1 - pull_output (captured stderr/stdout from failed pull)
+#   $2 - operation type (optional, e.g., "install", "update")
+# Returns: JSON object with comprehensive Docker pull diagnostics
+# Note: Performs network tests (registry, DNS) which may take a few seconds
+collect_docker_pull_diagnostics() {
+    local pull_output="$1"
+    local operation="${2:-pull}"
+    local docker_version
+    local disk_space
+    local registry_reachable="unknown"
+    local dns_resolution="unknown"
+    local pull_error
+
+    # Collect Docker and disk info (avoid SC2155)
+    docker_version=$(docker version --format '{{.Server.Version}}' 2>/dev/null || echo "unknown")
+    disk_space=$(df -h /var/lib/docker 2>/dev/null | awk 'NR==2 {print $4}' || echo "unknown")
+
+    # Test registry connectivity
+    if curl -s --max-time 5 "https://ghcr.io/v2/" >/dev/null 2>&1; then
+        registry_reachable="yes"
+    else
+        registry_reachable="no"
+    fi
+
+    # Test DNS resolution for ghcr.io
+    if nslookup ghcr.io >/dev/null 2>&1 || host ghcr.io >/dev/null 2>&1; then
+        dns_resolution="success"
+    else
+        dns_resolution="failed"
+    fi
+
+    # Truncate pull error safely
+    pull_error=$(echo "$pull_output" | tail -5 | tr '\n' ' ' | sed 's/"/\\"/g' | head -c "$MAX_ERROR_LENGTH")
+
+    cat <<EOF
+{
+    "image": "${BIRDNET_GO_IMAGE}",
+    "docker_version": "$docker_version",
+    "available_disk_space": "$disk_space",
+    "registry_reachable": "$registry_reachable",
+    "dns_resolution": "$dns_resolution",
+    "pull_error": "$pull_error",
+    "user": "$USER",
+    "docker_socket": "$(ls -la /var/run/docker.sock 2>&1 | sed 's/"/\\"/g')",
+    "operation": "$operation"
+}
+EOF
+}
+
 # Function to send telemetry event
 send_telemetry_event() {
     # Check if telemetry is enabled
     if [ "$TELEMETRY_ENABLED" != "true" ]; then
         return 0
     fi
-    
+
     local event_type="$1"
     local message="$2"
     local level="${3:-info}"
     local context="${4:-}"
-    
+    local diagnostic_json="${5:-{}}"  # Optional structured diagnostic data
+
+    # Validate diagnostic JSON before using
+    diagnostic_json=$(validate_diagnostic_json "$diagnostic_json")
+
     # Collect system info before background process
     local system_info
     system_info=$(collect_system_info)
-    
+
     # Run in background to not block installation
     {
-        
-        # Build JSON payload
+
+        # Build JSON payload with enhanced diagnostic information
         local timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
         local payload=$(cat <<EOF
 {
     "timestamp": "$timestamp",
     "level": "$level",
-    "message": "$message",
+    "message": "[install.sh] $message",
     "platform": "other",
     "environment": "production",
     "release": "install-script@1.0.0",
     "tags": {
         "event_type": "$event_type",
-        "script_version": "1.0.0"
+        "script_version": "1.0.0",
+        "source": "install.sh"
     },
     "contexts": {
         "os": {
@@ -1683,7 +1929,8 @@ send_telemetry_event() {
     "extra": {
         "docker_version": "$(echo "$system_info" | jq -r .docker_version)",
         "install_id": "$(echo "$system_info" | jq -r .install_id)",
-        "context": "$context"
+        "context": "$context",
+        "diagnostics": $diagnostic_json
     }
 }
 EOF
@@ -1713,11 +1960,70 @@ check_docker_space() {
     local required_space=2000000  # 2GB in KB
     local available_space
     available_space=$(df -k /var/lib/docker | awk 'NR==2 {print $4}')
-    
+
     if [ "$available_space" -lt "$required_space" ]; then
         print_message "❌ Insufficient disk space for Docker image" "$RED"
         print_message "Required: 2GB, Available: $((available_space/1024))MB" "$YELLOW"
         exit 1
+    fi
+}
+
+# Function to check data directory disk space requirements
+check_data_directory_space() {
+    local required_space=1048576  # 1GB in KB (1024*1024)
+    local data_dir="${1:-$DATA_DIR}"
+
+    # Ensure directory exists
+    mkdir -p "$data_dir" 2>/dev/null || true
+
+    # Get available space in KB with POSIX-compliant output
+    local available_space
+    available_space=$(df -Pk "$data_dir" 2>/dev/null | awk 'NR==2 {print $4}')
+
+    # Check if df succeeded
+    if [ -z "$available_space" ]; then
+        print_message "❌ Unable to determine free space for $data_dir" "$RED"
+        exit 1
+    fi
+
+    local available_mb=$((available_space/1024))
+
+    if [ "$available_space" -lt "$required_space" ]; then
+        print_message "❌ ERROR: Insufficient disk space for BirdNET-Go data directory" "$RED"
+        print_message "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" "$RED"
+        print_message "Location:  $data_dir" "$YELLOW"
+        print_message "Required:  1024 MB minimum" "$YELLOW"
+        print_message "Available: ${available_mb} MB" "$RED"
+        print_message "" "$NC"
+        print_message "💡 To resolve this issue:" "$YELLOW"
+        print_message "  1. Free up disk space on the volume" "$YELLOW"
+        print_message "  2. Use a different location with more space" "$YELLOW"
+        print_message "  3. Clean up old data: rm -rf $data_dir/clips/*" "$YELLOW"
+        print_message "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" "$RED"
+
+        # Send telemetry if enabled (with PII redaction)
+        # Redact path by hashing it to avoid exposing user's directory structure
+        local path_hash
+        path_hash=$(echo -n "$data_dir" | sha256sum | cut -d' ' -f1)
+        local mount_point
+        mount_point=$(df -P "$data_dir" 2>/dev/null | awk 'NR==2 {print $1}')
+
+        # Split declaration and assignment to avoid SC2155
+        local diagnostic_json
+        diagnostic_json=$(cat <<EOF
+{
+    "data_directory_hash": "$path_hash",
+    "required_mb": 1024,
+    "available_mb": $available_mb,
+    "mount_point": "$mount_point"
+}
+EOF
+)
+        send_telemetry_event "error" "Insufficient disk space for data directory" "error" "step=check_data_space" "$diagnostic_json"
+        exit 1
+    else
+        log_message "INFO" "Data directory space check passed: ${available_mb}MB available (minimum: 1024MB)"
+        print_message "✅ Data directory has sufficient space: ${available_mb}MB available" "$GREEN"
     fi
 }
 
@@ -1746,13 +2052,19 @@ pull_docker_image() {
         log_message "INFO" "Image not found locally, will be fresh pull"
     fi
 
-    if docker pull "${BIRDNET_GO_IMAGE}"; then
+    # Capture pull output and status
+    local pull_output
+    local pull_status
+    pull_output=$(docker pull "${BIRDNET_GO_IMAGE}" 2>&1)
+    pull_status=$?
+
+    if [ $pull_status -eq 0 ]; then
         log_message "INFO" "Docker image pulled successfully: $BIRDNET_GO_IMAGE"
-        
+
         # Get image hash after pull and compare
         local post_pull_hash=""
         post_pull_hash=$(docker inspect --format='{{.Id}}' "${BIRDNET_GO_IMAGE}" 2>/dev/null || echo "")
-        
+
         if [ -n "$pre_pull_hash" ] && [ "$pre_pull_hash" = "$post_pull_hash" ]; then
             log_message "INFO" "No image update detected, same hash: ${pre_pull_hash:0:20}..."
             print_message "✅ Docker image is already up to date" "$GREEN"
@@ -1769,7 +2081,12 @@ pull_docker_image() {
         fi
     else
         log_message "ERROR" "Docker image pull failed: $BIRDNET_GO_IMAGE"
-        send_telemetry_event "error" "Docker image pull failed" "error" "step=pull_docker_image,image=${BIRDNET_GO_IMAGE}"
+
+        # Collect detailed diagnostics using helper function
+        local diagnostic_json
+        diagnostic_json=$(collect_docker_pull_diagnostics "$pull_output" "install")
+
+        send_telemetry_event "error" "Docker image pull failed" "error" "step=pull_docker_image" "$diagnostic_json"
         print_message "❌ Failed to pull Docker image" "$RED"
         print_message "This could be due to:" "$YELLOW"
         print_message "- No internet connection" "$YELLOW"
@@ -1886,8 +2203,10 @@ check_birdnet_installation() {
 
 # Function to check if we have preserved data from previous installation
 check_preserved_data() {
-    if [ -f "$CONFIG_FILE" ] || [ -d "$DATA_DIR" ]; then
-        return 0  # Preserved data exists
+    # Only consider data preserved if the config file actually exists
+    # Empty directories don't count as preserved data (they might be from incomplete install)
+    if [ -f "$CONFIG_FILE" ]; then
+        return 0  # Preserved data exists (actual config file)
     fi
     return 1  # No preserved data
 }
@@ -2030,7 +2349,37 @@ download_base_config() {
     # Download new config to temporary file first
     local temp_config="/tmp/config.yaml.new"
     if ! curl -s --fail https://raw.githubusercontent.com/tphakala/birdnet-go/main/internal/conf/config.yaml > "$temp_config"; then
-        send_telemetry_event "error" "Configuration download failed" "error" "step=download_base_config"
+        # Collect diagnostic information about the download failure
+        local curl_error=$(curl -v --fail https://raw.githubusercontent.com/tphakala/birdnet-go/main/internal/conf/config.yaml 2>&1 | tail -5 | tr '\n' ' ' | sed 's/"/\\"/g')
+        local dns_test="unknown"
+        local http_test="unknown"
+
+        # Test DNS resolution
+        if nslookup raw.githubusercontent.com >/dev/null 2>&1 || host raw.githubusercontent.com >/dev/null 2>&1; then
+            dns_test="success"
+        else
+            dns_test="failed"
+        fi
+
+        # Test HTTP connectivity
+        if curl -s --max-time 5 -I https://raw.githubusercontent.com >/dev/null 2>&1; then
+            http_test="success"
+        else
+            http_test="failed"
+        fi
+
+        local diagnostic_json=$(cat <<EOF
+{
+    "url": "https://raw.githubusercontent.com/tphakala/birdnet-go/main/internal/conf/config.yaml",
+    "curl_error": "$(echo "$curl_error" | head -c 500)",
+    "dns_resolution": "$dns_test",
+    "http_connectivity": "$http_test",
+    "temp_file": "$temp_config"
+}
+EOF
+)
+
+        send_telemetry_event "error" "Configuration download failed" "error" "step=download_base_config" "$diagnostic_json"
         print_message "❌ Failed to download configuration template" "$RED"
         print_message "This could be due to:" "$YELLOW"
         print_message "- No internet connection or DNS resolution failed" "$YELLOW"
@@ -2172,7 +2521,42 @@ validate_audio_device() {
 
     # Test audio device access - using LC_ALL=C to force English output
     if ! LC_ALL=C arecord -c 1 -f S16_LE -r 48000 -d 1 -D "$device" /dev/null 2>/dev/null; then
-        send_telemetry_event "error" "Audio device validation failed" "error" "step=validate_audio_device,device=$device"
+        # Collect detailed audio device diagnostics (raw output, will be safely encoded)
+        local arecord_error
+        local device_list
+        local alsa_devices
+        local user_groups
+
+        arecord_error=$(LC_ALL=C arecord -c 1 -f S16_LE -r 48000 -d 1 -D "$device" /dev/null 2>&1 | head -c "$MAX_ERROR_LENGTH")
+        device_list=$(arecord -l 2>&1 | head -c "$MAX_ERROR_LENGTH")
+        alsa_devices=$(ls -la /dev/snd/ 2>&1 | head -c "$MAX_ERROR_LENGTH")
+        user_groups=$(groups 2>&1 || echo "unknown")
+
+        # Use jq to safely construct JSON (handles newlines, quotes, special characters)
+        local diagnostic_json
+        diagnostic_json=$(jq -n \
+            --arg device "$device" \
+            --arg error "$arecord_error" \
+            --arg devices "$device_list" \
+            --arg perms "$alsa_devices" \
+            --arg user "$USER" \
+            --arg groups "$user_groups" \
+            '{
+                device: $device,
+                arecord_error: $error,
+                available_devices: $devices,
+                alsa_device_permissions: $perms,
+                user: $user,
+                user_groups: $groups,
+                test_parameters: {
+                    channels: 1,
+                    format: "S16_LE",
+                    rate: 48000,
+                    duration: 1
+                }
+            }')
+
+        send_telemetry_event "error" "Audio device validation failed" "error" "step=validate_audio_device" "$diagnostic_json"
         print_message "❌ Failed to access audio device" "$RED"
         print_message "This could be due to:" "$YELLOW"
         print_message "  • Device is busy" "$YELLOW"
@@ -2191,9 +2575,10 @@ configure_sound_card() {
     log_message "INFO" "Starting sound card configuration"
     while true; do
         print_message "\n🎤 Detected audio devices:" "$GREEN"
-        
+
         # Create arrays to store device information
-        declare -a devices
+        # Reset the array to empty on each iteration to prevent accumulation
+        devices=()
         local default_selection=0
         
         # Capture arecord output to a variable first, forcing English locale 
@@ -2569,15 +2954,65 @@ configure_timezone() {
     read -r use_detected
     
     if [[ $use_detected != "y" ]]; then
-        print_message "\n📋 Common timezone examples:" "$YELLOW"
-        print_message "  • US/Eastern, US/Central, US/Mountain, US/Pacific" "$YELLOW"
-        print_message "  • Europe/London, Europe/Berlin, Europe/Paris" "$YELLOW"
-        print_message "  • Asia/Tokyo, Asia/Singapore, Asia/Dubai" "$YELLOW"
-        print_message "  • Australia/Sydney, Australia/Melbourne" "$YELLOW"
-        print_message "  • UTC (Coordinated Universal Time)" "$YELLOW"
-        
+        print_message "\n📋 Common timezone examples (canonical IANA format):" "$YELLOW"
+        print_message "  Americas:" "$YELLOW"
+        print_message "    • America/New_York (US Eastern)" "$NC"
+        print_message "    • America/Chicago (US Central)" "$NC"
+        print_message "    • America/Denver (US Mountain)" "$NC"
+        print_message "    • America/Los_Angeles (US Pacific)" "$NC"
+        print_message "  Europe:" "$YELLOW"
+        print_message "    • Europe/London, Europe/Berlin, Europe/Paris" "$NC"
+        print_message "  Asia:" "$YELLOW"
+        print_message "    • Asia/Tokyo, Asia/Singapore, Asia/Dubai" "$NC"
+        print_message "  Other:" "$YELLOW"
+        print_message "    • Australia/Sydney, Pacific/Auckland, UTC" "$NC"
+        print_message "" "$NC"
+        print_message "⚠️  Note: Legacy formats like US/Mountain are deprecated" "$YELLOW"
+        print_message "   Use canonical formats (e.g., America/Denver) for best compatibility" "$YELLOW"
+
+        # Helper function to check and offer canonical timezone alternatives
+        check_and_offer_canonical_tz() {
+            local tz="$1"
+            local tz_var_name="$2"  # Variable name to update
+
+            if [[ "$tz" =~ ^US/ ]] || [[ "$tz" =~ ^Etc/ ]]; then
+                print_message "" "$NC"
+                print_message "⚠️  WARNING: '$tz' uses legacy timezone format" "$YELLOW"
+                print_message "   This format was moved to tzdata-legacy in Debian 13 (Trixie)" "$YELLOW"
+
+                # Suggest canonical alternative
+                local canonical_alternative=""
+                case "$tz" in
+                    "US/Eastern") canonical_alternative="America/New_York" ;;
+                    "US/Central") canonical_alternative="America/Chicago" ;;
+                    "US/Mountain") canonical_alternative="America/Denver" ;;
+                    "US/Pacific") canonical_alternative="America/Los_Angeles" ;;
+                    "US/Alaska") canonical_alternative="America/Anchorage" ;;
+                    "US/Hawaii") canonical_alternative="Pacific/Honolulu" ;;
+                esac
+
+                if [ -n "$canonical_alternative" ]; then
+                    print_message "   💡 Recommended canonical format: $canonical_alternative" "$GREEN"
+                    print_message "" "$NC"
+                    print_message "❓ Would you like to use $canonical_alternative instead? (y/n): " "$YELLOW" "nonewline"
+                    read -r use_canonical
+
+                    if [[ $use_canonical == "y" ]]; then
+                        eval "$tz_var_name=\"$canonical_alternative\""
+                        detected_tz="$canonical_alternative"
+                        print_message "✅ Using canonical timezone: $canonical_alternative" "$GREEN"
+                    else
+                        print_message "⚠️  Continuing with legacy format (requires tzdata-legacy package)" "$YELLOW"
+                    fi
+                else
+                    print_message "   💡 Consider using the canonical IANA timezone format" "$YELLOW"
+                    print_message "   See: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones" "$NC"
+                fi
+            fi
+        }
+
         while true; do
-            print_message "\n❓ Enter your timezone (e.g., US/Eastern, Europe/London): " "$YELLOW" "nonewline"
+            print_message "\n❓ Enter your timezone (e.g., America/New_York, Europe/London): " "$YELLOW" "nonewline"
             read -r user_tz
             
             # Convert lowercase input to proper case format
@@ -2594,7 +3029,10 @@ configure_timezone() {
             if [ -f "/usr/share/zoneinfo/$user_tz" ]; then
                 detected_tz="$user_tz"
                 print_message "✅ Timezone '$user_tz' is valid" "$GREEN"
-                
+
+                # Check if timezone uses legacy format and offer canonical alternative
+                check_and_offer_canonical_tz "$user_tz" "user_tz"
+
                 # Show what time it would be in that timezone
                 local tz_time=$(TZ="$user_tz" date +"%Y-%m-%d %H:%M:%S %Z")
                 print_message "🕐 Time in $user_tz: $tz_time" "$YELLOW"
@@ -2610,7 +3048,10 @@ configure_timezone() {
             elif [ -f "/usr/share/zoneinfo/$normalized_tz" ]; then
                 detected_tz="$normalized_tz"
                 print_message "✅ Timezone '$normalized_tz' is valid" "$GREEN"
-                
+
+                # Check if timezone uses legacy format and offer canonical alternative
+                check_and_offer_canonical_tz "$normalized_tz" "normalized_tz"
+
                 # Show what time it would be in that timezone
                 local tz_time=$(TZ="$normalized_tz" date +"%Y-%m-%d %H:%M:%S %Z")
                 print_message "🕐 Time in $normalized_tz: $tz_time" "$YELLOW"
@@ -2624,12 +3065,24 @@ configure_timezone() {
                     print_message "Let's try again with a different timezone" "$YELLOW"
                 fi
             else
-                print_message "❌ Invalid timezone '$user_tz'" "$RED"
+                print_message "❌ Timezone '$user_tz' not found" "$RED"
                 if [ "$user_tz" != "$normalized_tz" ]; then
                     print_message "   Also tried: '$normalized_tz'" "$RED"
                 fi
-                print_message "💡 Tip: You can list all available timezones with: timedatectl list-timezones" "$YELLOW"
-                print_message "   Or check /usr/share/zoneinfo/ directory" "$YELLOW"
+
+                # Check if this is a known legacy name that requires tzdata-legacy
+                if [[ "$user_tz" =~ ^US/ ]] || [[ "$user_tz" =~ ^Etc/ ]]; then
+                    print_message "" "$NC"
+                    print_message "⚠️  This appears to be a legacy timezone name" "$YELLOW"
+                    print_message "   On Debian 13 (Trixie), legacy timezones require the tzdata-legacy package" "$YELLOW"
+                    print_message "" "$NC"
+                    print_message "💡 You have two options:" "$YELLOW"
+                    print_message "   1. Use a canonical timezone format instead (recommended)" "$GREEN"
+                    print_message "   2. Install tzdata-legacy package: sudo apt install tzdata-legacy" "$YELLOW"
+                else
+                    print_message "💡 Tip: You can list all available timezones with: timedatectl list-timezones" "$YELLOW"
+                    print_message "   Or check /usr/share/zoneinfo/ directory" "$YELLOW"
+                fi
             fi
         done
     fi
@@ -3409,6 +3862,60 @@ check_container_running() {
     fi
 }
 
+# Function to show service diagnostics
+show_service_diagnostics() {
+    print_message "\n📋 BirdNET-Go Service Diagnostics" "$GREEN"
+    print_message "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" "$GRAY"
+
+    # Service status (only if systemd is available)
+    if command_exists systemctl; then
+        if systemctl is-active --quiet birdnet-go.service 2>/dev/null; then
+            print_message "✅ Service Status: Running" "$GREEN"
+        else
+            print_message "❌ Service Status: Not Running" "$RED"
+
+            # Only show logs if journalctl is available
+            if command_exists journalctl; then
+                print_message "\n📄 Last 30 log lines:" "$YELLOW"
+                journalctl -u birdnet-go.service -n 30 --no-pager 2>/dev/null || echo "Unable to retrieve logs"
+
+                print_message "\n💡 To view live logs, run:" "$YELLOW"
+                print_message "   journalctl -u birdnet-go.service -f" "$NC"
+            fi
+        fi
+    else
+        print_message "⚠️  systemd not available - cannot check service status" "$YELLOW"
+    fi
+
+    # Container status (only if Docker is available)
+    if command_exists docker; then
+        print_message "\n🐳 Docker Container Status:" "$YELLOW"
+        safe_docker ps -a --filter "name=birdnet-go" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" 2>/dev/null || echo "Unable to retrieve container status"
+    else
+        print_message "\n⚠️  Docker not available - cannot check container status" "$YELLOW"
+    fi
+
+    # Disk space (only if DATA_DIR is set)
+    if [ -n "$DATA_DIR" ]; then
+        print_message "\n💾 Disk Space:" "$YELLOW"
+        print_message "Data directory: $DATA_DIR" "$NC"
+        df -h "$DATA_DIR" 2>/dev/null | tail -1 || echo "Unable to check disk space"
+    else
+        print_message "\n⚠️  Data directory not configured - cannot check disk space" "$YELLOW"
+    fi
+
+    # If service failed, show prominent error (only if systemd is available)
+    if command_exists systemctl && systemctl is-failed --quiet birdnet-go.service 2>/dev/null; then
+        print_message "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" "$RED"
+        print_message "⚠️  SERVICE FAILED TO START" "$RED"
+        print_message "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" "$RED"
+        print_message "\nTo restart: sudo systemctl restart birdnet-go.service" "$YELLOW"
+        if command_exists journalctl; then
+            print_message "View logs:  sudo journalctl -u birdnet-go.service -n 50" "$YELLOW"
+        fi
+    fi
+}
+
 # Function to get all BirdNET containers (including stopped ones)
 get_all_containers() {
     if command_exists docker; then
@@ -3679,12 +4186,21 @@ clean_installation() {
         # Show error list if there were problems
         if [ -n "$error_list" ]; then
             print_message "The following files could not be removed:" "$RED"
-            printf '%b' "$error_list" 
+            printf '%b' "$error_list"
             print_message "\n⚠️ Some cleanup operations failed" "$RED"
             print_message "You may need to manually remove remaining files" "$YELLOW"
             return 1
         else
             print_message "✅ Removed data directories" "$GREEN"
+
+            # Remove parent directory if empty
+            local parent_dir="$HOME/birdnet-go-app"
+            if [ -d "$parent_dir" ]; then
+                if [ -z "$(ls -A "$parent_dir" 2>/dev/null)" ]; then
+                    rm -rf "$parent_dir" 2>/dev/null || sudo rm -rf "$parent_dir"
+                    print_message "✅ Removed parent directory" "$GREEN"
+                fi
+            fi
         fi
     fi
     
@@ -3718,27 +4234,191 @@ start_birdnet_go() {
     
     # Start or restart the service
     log_message "INFO" "Executing systemctl $action birdnet-go.service"
+    local systemctl_exit_code=0
     sudo systemctl $action birdnet-go.service
-    log_command_result "systemctl $action birdnet-go.service" $? "${action_msg} BirdNET-Go service"
-    
+    systemctl_exit_code=$?
+    log_command_result "systemctl $action birdnet-go.service" $systemctl_exit_code "${action_msg} BirdNET-Go service"
+
     # Check if service started
     if ! sudo systemctl is-active --quiet birdnet-go.service; then
         log_message "ERROR" "BirdNET-Go service failed to start"
-        send_telemetry_event "error" "Service startup failed" "error" "step=start_birdnet_go"
+
+        # Collect comprehensive service diagnostics
+        local service_status=$(systemctl status birdnet-go.service 2>&1 | sed 's/"/\\"/g' | tr '\n' ';')
+        local service_logs=$(journalctl -u birdnet-go.service -n 50 --no-pager 2>&1 | sed 's/"/\\"/g' | tr '\n' ';')
+        local service_enabled=$(systemctl is-enabled birdnet-go.service 2>&1 || echo "unknown")
+        local docker_running=$(docker ps --format "{{.Names}}: {{.Status}}" 2>&1 | sed 's/"/\\"/g' | tr '\n' ';')
+        local docker_errors=$(docker ps -a --filter "status=exited" --format "{{.Names}}: {{.Status}}" 2>&1 | sed 's/"/\\"/g' | tr '\n' ';')
+
+        # Extract structured error information
+        local error_type="unknown"
+        local error_detail=""
+
+        # Check for common failure patterns in logs
+        if echo "$service_logs" | grep -qi "bind: address already in use"; then
+            error_type="port_conflict"
+            error_detail=$(echo "$service_logs" | grep -oP "port \d+" | head -1 || echo "port conflict detected")
+        elif echo "$service_logs" | grep -qi "permission denied"; then
+            error_type="permission_denied"
+            error_detail=$(echo "$service_logs" | grep -i "permission denied" | head -1 | sed 's/"/\\"/g' | head -c 200)
+        elif echo "$service_logs" | grep -qi "No such image\|image not found"; then
+            error_type="image_missing"
+            error_detail="$BIRDNET_GO_IMAGE"
+        elif echo "$service_logs" | grep -qi "OOMKilled\|Out of memory"; then
+            error_type="out_of_memory"
+            error_detail="Container killed due to memory exhaustion"
+        elif echo "$service_logs" | grep -qi "container .* is already in use\|name.*already in use"; then
+            error_type="container_name_conflict"
+            error_detail="Container name 'birdnet-go' already exists"
+        elif echo "$service_logs" | grep -qi "timeout\|timed out"; then
+            error_type="timeout"
+            error_detail="Service startup timeout"
+        elif echo "$service_logs" | grep -qi "failed to create endpoint\|network"; then
+            error_type="network_error"
+            error_detail=$(echo "$service_logs" | grep -i "network\|endpoint" | head -1 | sed 's/"/\\"/g' | head -c 200)
+        fi
+
+        # Get container-specific logs if container exists (even if exited)
+        local container_logs="none"
+        local container_exit_code="unknown"
+        local container_id
+        container_id=$(docker ps -a --filter "name=birdnet-go" --format "{{.ID}}" 2>/dev/null | head -1)
+
+        if [ -n "$container_id" ]; then
+            container_logs=$(docker logs --tail 30 "$container_id" 2>&1 | sed 's/"/\\"/g' | tr '\n' ';' | tail -c "$MAX_LOG_LENGTH")
+            container_exit_code=$(docker inspect "$container_id" --format='{{.State.ExitCode}}' 2>/dev/null || echo "unknown")
+        fi
+
+        # Check for resource constraints
+        local disk_full="false"
+        local memory_available="unknown"
+        local docker_space="unknown"
+
+        # Check disk space on critical paths
+        if [ -d "$CONFIG_DIR" ] && [ "$(df --output=pcent "$CONFIG_DIR" 2>/dev/null | tail -1 | tr -d '% ' || echo 0)" -gt 95 ]; then
+            disk_full="config_dir"
+        elif [ -d "/var/lib/docker" ] && [ "$(df --output=pcent /var/lib/docker 2>/dev/null | tail -1 | tr -d '% ' || echo 0)" -gt 95 ]; then
+            disk_full="docker_dir"
+        fi
+
+        memory_available=$(free -m 2>/dev/null | awk 'NR==2 {print $7}' || echo "unknown")
+        docker_space=$(df -h /var/lib/docker 2>/dev/null | awk 'NR==2 {print $4}' || echo "unknown")
+
+        # Verify the Docker image
+        local image_exists="false"
+        local image_size="unknown"
+        if docker inspect "$BIRDNET_GO_IMAGE" >/dev/null 2>&1; then
+            image_exists="true"
+            image_size=$(docker inspect "$BIRDNET_GO_IMAGE" --format='{{.Size}}' 2>/dev/null | awk '{printf "%.1f MB", $1/1024/1024}' || echo "unknown")
+        fi
+
+        # Check config file validity
+        local config_valid="unknown"
+        local config_error="none"
+        local config_exists="false"
+
+        if [ -f "$CONFIG_FILE" ]; then
+            config_exists="true"
+            # Basic YAML syntax check if available
+            if command -v yamllint >/dev/null 2>&1; then
+                config_error=$(yamllint "$CONFIG_FILE" 2>&1 | head -c 300)
+                [ $? -eq 0 ] && config_valid="true" || config_valid="false"
+            fi
+        fi
+
+        # Check for port conflicts
+        local port_conflicts=()
+        for port in 80 443 "${WEB_PORT:-8080}" 8090; do
+            if ! check_port_availability "$port" 2>/dev/null; then
+                local proc_info
+                proc_info=$(get_port_process_info "$port" 2>/dev/null)
+                port_conflicts+=("\"$port:$(echo "$proc_info" | sed 's/"/\\"/g')\"")
+            fi
+        done
+
+        # Build comprehensive diagnostic JSON using jq for safety
+        local diagnostic_json
+        diagnostic_json=$(jq -n \
+            --arg exit_code "$systemctl_exit_code" \
+            --arg error_type "$error_type" \
+            --arg error_detail "$error_detail" \
+            --arg service_status "$(echo "$service_status" | tail -c 500)" \
+            --arg service_enabled "$service_enabled" \
+            --arg service_logs "$(echo "$service_logs" | tail -c 800)" \
+            --arg action "$action" \
+            --arg container_id "${container_id:-none}" \
+            --arg container_logs "$container_logs" \
+            --arg container_exit_code "$container_exit_code" \
+            --arg docker_running "$(echo "$docker_running" | head -c 300)" \
+            --arg docker_errors "$(echo "$docker_errors" | head -c 300)" \
+            --arg image_tag "${BIRDNET_GO_IMAGE}" \
+            --arg image_exists "$image_exists" \
+            --arg image_size "$image_size" \
+            --arg image_changed "${IMAGE_CHANGED}" \
+            --arg disk_full "$disk_full" \
+            --arg memory_available "$memory_available" \
+            --arg docker_space "$docker_space" \
+            --arg config_exists "$config_exists" \
+            --arg config_valid "$config_valid" \
+            --arg config_error "$config_error" \
+            --arg web_port "${WEB_PORT:-8080}" \
+            --argjson port_conflicts "[$(IFS=,; echo "${port_conflicts[*]}")]" \
+            '{
+                error_analysis: {
+                    exit_code: ($exit_code | tonumber),
+                    error_type: $error_type,
+                    error_detail: $error_detail
+                },
+                service: {
+                    status: $service_status,
+                    enabled: $service_enabled,
+                    logs: $service_logs,
+                    action_attempted: $action
+                },
+                container: {
+                    id: $container_id,
+                    logs: $container_logs,
+                    exit_code: $container_exit_code,
+                    running_containers: $docker_running,
+                    exited_containers: $docker_errors
+                },
+                image: {
+                    tag: $image_tag,
+                    exists: $image_exists,
+                    size: $image_size,
+                    changed: $image_changed
+                },
+                resources: {
+                    disk_full: $disk_full,
+                    memory_available_mb: $memory_available,
+                    docker_space: $docker_space
+                },
+                config: {
+                    file_exists: $config_exists,
+                    valid: $config_valid,
+                    error: $config_error
+                },
+                ports: {
+                    web_port: $web_port,
+                    conflicts: $port_conflicts
+                }
+            }')
+
+        send_telemetry_event "error" "Service startup failed: $error_type" "error" "step=start_birdnet_go,error_type=$error_type" "$diagnostic_json"
         print_message "❌ Failed to start BirdNET-Go service" "$RED"
-        
+
         # Get and display journald logs for troubleshooting
         log_message "INFO" "Retrieving service logs for troubleshooting"
         print_message "\n📋 Service logs (last 20 entries):" "$YELLOW"
         journalctl -u birdnet-go.service -n 20 --no-pager
-        
+
         print_message "\n❗ If you need help with this issue:" "$RED"
         print_message "1. Check port availability and permissions" "$YELLOW"
         print_message "2. Verify your audio device is properly connected and accessible" "$YELLOW"
         print_message "3. If the issue persists, please open a ticket at:" "$YELLOW"
         print_message "   https://github.com/tphakala/birdnet-go/issues" "$GREEN"
         print_message "   Include the logs above in your issue report for faster troubleshooting" "$YELLOW"
-        
+
         exit 1
     fi
     log_message "INFO" "BirdNET-Go service started successfully"
@@ -3958,12 +4638,12 @@ optimize_settings() {
     case $rpi_model in
         5)
             # RPi 5 settings
-            sed -i 's/overlap: 1.5/overlap: 2.7/' "$CONFIG_FILE"
+            sed -i 's/overlap: 1.5/overlap: 2.0/' "$CONFIG_FILE"
             print_message "✅ Applied optimized settings for Raspberry Pi 5" "$GREEN"
             ;;
         4)
             # RPi 4 settings
-            sed -i 's/overlap: 1.5/overlap: 2.6/' "$CONFIG_FILE"
+            sed -i 's/overlap: 1.5/overlap: 2.0/' "$CONFIG_FILE"
             print_message "✅ Applied optimized settings for Raspberry Pi 4" "$GREEN"
             ;;
         3)
@@ -4349,19 +5029,25 @@ handle_docker_install_menu() {
             
             log_message "INFO" "Starting Docker image pull: $BIRDNET_GO_IMAGE"
             print_message "\n🔄 Installing BirdNET-Go Docker image: $BIRDNET_GO_VERSION..." "$YELLOW"
-            
-            if docker pull "${BIRDNET_GO_IMAGE}"; then
+
+            # Capture pull output and status
+            local pull_output
+            local pull_status
+            pull_output=$(docker pull "${BIRDNET_GO_IMAGE}" 2>&1)
+            pull_status=$?
+
+            if [ $pull_status -eq 0 ]; then
                 log_message "INFO" "Docker image pull completed successfully"
-                
+
                 # Capture new image hash after update
                 local post_update_image_hash
                 post_update_image_hash=$(capture_current_image_hash "docker-post-update")
-                
+
                 # Log post-update state
                 log_message "INFO" "=== Post-Update System State ==="
                 log_docker_state "docker-update-post"
                 log_system_resources "docker-update-post"
-                
+
                 # Check if the image actually changed
                 if [ "$pre_update_image_hash" = "$post_update_image_hash" ]; then
                     log_message "INFO" "Image hash unchanged - already on latest version"
@@ -4370,22 +5056,32 @@ handle_docker_install_menu() {
                     log_message "INFO" "Image updated from ${pre_update_image_hash:0:12} to ${post_update_image_hash:0:12}"
                     print_message "✅ Successfully updated to latest image" "$GREEN"
                 fi
-                
+
                 print_message "⚠️ Note: You will need to restart your container to use the updated image" "$YELLOW"
                 log_message "INFO" "Docker image update process completed successfully"
-                
+
                 # Send telemetry
                 send_telemetry_event "info" "Docker image update completed" "info" "step=docker_update,updated=$([[ "$pre_update_image_hash" != "$post_update_image_hash" ]] && echo "true" || echo "false")"
-                
+
                 exit 0
             else
                 log_message "ERROR" "Failed to pull Docker image: $BIRDNET_GO_IMAGE"
                 log_command_result "docker pull ${BIRDNET_GO_IMAGE}" 1 "docker image pull"
                 print_message "❌ Failed to update Docker image" "$RED"
-                
+
+                # Collect diagnostics using helper function, then add update-specific data
+                local diagnostic_json
+                local current_images
+                diagnostic_json=$(collect_docker_pull_diagnostics "$pull_output" "update")
+                current_images=$(docker images --format "{{.Repository}}:{{.Tag}} {{.ID}}" 2>/dev/null | grep birdnet-go | sed 's/"/\\"/g' | tr '\n' ';' | head -c "$MAX_FLAGS_LENGTH" || echo "unavailable")
+
+                # Merge with update-specific fields
+                diagnostic_json=$(echo "$diagnostic_json" | jq --arg images "$current_images" --arg hash "${pre_update_image_hash:0:20}" \
+                    '. + {current_images: $images, pre_update_hash: $hash}' 2>/dev/null || echo "$diagnostic_json")
+
                 # Send telemetry for failure
-                send_telemetry_event "error" "Docker image update failed" "error" "step=docker_update"
-                
+                send_telemetry_event "error" "Docker image update failed during pull" "error" "step=docker_update" "$diagnostic_json"
+
                 exit 1
             fi
             ;;
@@ -4449,6 +5145,12 @@ handle_docker_install_menu() {
                     print_message "📁 Removing data directories..." "$YELLOW"
                     rm -rf "$CONFIG_DIR" "$DATA_DIR" 2>/dev/null || sudo rm -rf "$CONFIG_DIR" "$DATA_DIR"
                     print_message "✅ Removed data directories" "$GREEN"
+
+                    # Remove parent directory if empty
+                    local parent_dir="$HOME/birdnet-go-app"
+                    if [ -d "$parent_dir" ] && [ -z "$(ls -A "$parent_dir" 2>/dev/null)" ]; then
+                        rm -rf "$parent_dir" 2>/dev/null || sudo rm -rf "$parent_dir"
+                    fi
                 fi
                 FRESH_INSTALL="true"
             else
@@ -4543,6 +5245,12 @@ handle_preserved_data_menu() {
                     print_message "📁 Removing data directories..." "$YELLOW"
                     rm -rf "$CONFIG_DIR" "$DATA_DIR" 2>/dev/null || sudo rm -rf "$CONFIG_DIR" "$DATA_DIR"
                     print_message "✅ Removed existing data directories" "$GREEN"
+
+                    # Remove parent directory if empty
+                    local parent_dir="$HOME/birdnet-go-app"
+                    if [ -d "$parent_dir" ] && [ -z "$(ls -A "$parent_dir" 2>/dev/null)" ]; then
+                        rm -rf "$parent_dir" 2>/dev/null || sudo rm -rf "$parent_dir"
+                    fi
                 fi
                 FRESH_INSTALL="true"
             else
@@ -4563,6 +5271,12 @@ handle_preserved_data_menu() {
                         sudo rm -rf "$CONFIG_DIR" "$DATA_DIR"
                     fi
                     print_message "✅ All data has been successfully removed" "$GREEN"
+
+                    # Remove parent directory if empty
+                    local parent_dir="$HOME/birdnet-go-app"
+                    if [ -d "$parent_dir" ] && [ -z "$(ls -A "$parent_dir" 2>/dev/null)" ]; then
+                        rm -rf "$parent_dir" 2>/dev/null || sudo rm -rf "$parent_dir"
+                    fi
                 fi
                 exit 0
             else
@@ -4594,28 +5308,6 @@ handle_menu_selection() {
     fi
 }
 
-# Check if specific version was requested - if so, skip menu and install directly
-if [ "$BIRDNET_GO_VERSION" != "nightly" ] && ([ "$INSTALLATION_TYPE" != "none" ] || [ "$PRESERVED_DATA" = true ]); then
-    print_message "🚀 Installing/updating to version: $BIRDNET_GO_VERSION" "$GREEN"
-    
-    if [ "$INSTALLATION_TYPE" = "full" ]; then
-        check_network
-        if handle_container_update; then
-            exit 0
-        else
-            print_message "❌ Installation/update failed" "$RED"
-            exit 1
-        fi
-    elif [ "$INSTALLATION_TYPE" = "docker" ]; then
-        check_network
-        handle_docker_install_menu "1"
-        exit 0
-    elif [ "$PRESERVED_DATA" = true ]; then
-        handle_preserved_data_menu "1"
-        exit 0
-    fi
-fi
-
 # Menu loop for existing installations
 if [ "$INSTALLATION_TYPE" != "none" ] || [ "$PRESERVED_DATA" = true ]; then
     while true; do
@@ -4632,10 +5324,17 @@ if [ "$INSTALLATION_TYPE" != "none" ] || [ "$PRESERVED_DATA" = true ]; then
             # Handle menu selection
             handle_menu_selection "$INSTALLATION_TYPE" "$response"
             menu_result=$?
-            
-            # If menu action succeeded (returned 0), break from loop and continue
+
+            # If menu action succeeded (returned 0), operation is complete
+            # Most menu actions exit directly, but if they return 0, we should also exit
             if [ $menu_result -eq 0 ]; then
-                break
+                # Check if this was a fresh install request (option 3 typically)
+                # In that case, break to continue with installation
+                if [ "$FRESH_INSTALL" = "true" ]; then
+                    break
+                fi
+                # Otherwise, the menu action completed successfully, exit
+                exit 0
             fi
             # If menu action failed/cancelled (returned 1), continue loop to show menu again
         else
@@ -4727,6 +5426,10 @@ mkdir -p "$CONFIG_DIR"
 mkdir -p "$DATA_DIR"
 mkdir -p "$DATA_DIR/clips"
 print_message "✅ Created data directory and clips subdirectory" "$GREEN"
+
+# Check data directory has sufficient space
+print_message "\n💾 Checking data directory disk space..." "$YELLOW"
+check_data_directory_space "$DATA_DIR"
 
 # Download base config file
 download_base_config
@@ -4855,6 +5558,18 @@ if check_mdns; then
 else
     log_message "INFO" "mDNS not available"
 fi
+
+# Show service diagnostics
+show_service_diagnostics
+
+# Display helpful commands
+print_message "\n📚 Helpful Commands:" "$GREEN"
+print_message "  Check status:    sudo systemctl status birdnet-go" "$NC"
+print_message "  View logs:       sudo journalctl -u birdnet-go.service -f" "$NC"
+print_message "  Check disk:      df -h $DATA_DIR" "$NC"
+print_message "  Restart service: sudo systemctl restart birdnet-go" "$NC"
+print_message "  Container logs:  docker logs birdnet-go" "$NC"
+print_message "  Health status:   docker inspect --format '{{json .State.Health}}' birdnet-go | jq" "$NC"
 
 log_message "INFO" "Install.sh script execution completed successfully"
 log_message "INFO" "=== End of BirdNET-Go Installation/Update Session ==="

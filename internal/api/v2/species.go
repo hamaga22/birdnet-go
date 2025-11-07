@@ -36,11 +36,11 @@ const (
 
 // SpeciesInfo represents extended information about a bird species
 type SpeciesInfo struct {
-	ScientificName string                 `json:"scientific_name"`
-	CommonName     string                 `json:"common_name"`
-	Rarity         *SpeciesRarityInfo     `json:"rarity,omitempty"`
-	Taxonomy       *ebird.TaxonomyTree    `json:"taxonomy,omitempty"`
-	Metadata       map[string]interface{} `json:"metadata,omitempty"`
+	ScientificName string              `json:"scientific_name"`
+	CommonName     string              `json:"common_name"`
+	Rarity         *SpeciesRarityInfo  `json:"rarity,omitempty"`
+	Taxonomy       *ebird.TaxonomyTree `json:"taxonomy,omitempty"`
+	Metadata       map[string]any      `json:"metadata,omitempty"`
 }
 
 // SpeciesRarityInfo contains rarity information for a species
@@ -59,9 +59,14 @@ func (c *Controller) initSpeciesRoutes() {
 	// Public endpoints for species information
 	c.Group.GET("/species", c.GetSpeciesInfo)
 	c.Group.GET("/species/taxonomy", c.GetSpeciesTaxonomy)
-	
+
 	// RESTful thumbnail endpoint - uses species code from path
 	c.Group.GET("/species/:code/thumbnail", c.GetSpeciesThumbnail)
+
+	// New taxonomy endpoints using local database
+	c.Group.GET("/taxonomy/genus/:genus", c.GetGenusSpecies)
+	c.Group.GET("/taxonomy/family/:family", c.GetFamilySpecies)
+	c.Group.GET("/taxonomy/tree/:scientific_name", c.GetSpeciesTree)
 }
 
 // GetSpeciesInfo retrieves extended information about a bird species
@@ -136,7 +141,7 @@ func (c *Controller) getSpeciesInfo(ctx context.Context, scientificName string) 
 	info := &SpeciesInfo{
 		ScientificName: scientificName,
 		CommonName:     commonName,
-		Metadata:       make(map[string]interface{}),
+		Metadata:       make(map[string]any),
 	}
 
 	// Get rarity information
@@ -149,18 +154,35 @@ func (c *Controller) getSpeciesInfo(ctx context.Context, scientificName string) 
 		info.Rarity = rarityInfo
 	}
 
-	// Get taxonomy/family tree information from eBird if available
-	if c.EBirdClient != nil {
+	// Get taxonomy/family tree information - try local database first, then eBird API
+	if c.TaxonomyDB != nil {
+		// Try local taxonomy database first (fast, no network)
+		taxonomyTree, err := c.TaxonomyDB.BuildFamilyTree(scientificName)
+		if err == nil {
+			info.Taxonomy = taxonomyTree
+			info.Metadata["source"] = "local"
+			c.Debug("Retrieved taxonomy for %s from local database", scientificName)
+		} else {
+			// Fall back to eBird API if local lookup fails
+			c.Debug("Local taxonomy lookup failed for %s: %v, falling back to eBird API", scientificName, err)
+			if c.EBirdClient != nil {
+				taxonomyTree, ebirdErr := c.EBirdClient.BuildFamilyTree(ctx, scientificName)
+				if ebirdErr != nil {
+					c.Debug("Failed to get taxonomy info from eBird for species %s: %v", scientificName, ebirdErr)
+				} else {
+					info.Taxonomy = taxonomyTree
+					info.Metadata["source"] = "ebird"
+				}
+			}
+		}
+	} else if c.EBirdClient != nil {
+		// No local database available, use eBird API directly
 		taxonomyTree, err := c.EBirdClient.BuildFamilyTree(ctx, scientificName)
 		if err != nil {
-			// The eBird client already creates enhanced errors with proper
-			// categorization. These errors will be automatically published
-			// to the event bus when Build() is called in the client.
-			// We just log here for debugging purposes.
 			c.Debug("Failed to get taxonomy info from eBird for species %s: %v", scientificName, err)
-			// Continue without taxonomy info
 		} else {
 			info.Taxonomy = taxonomyTree
+			info.Metadata["source"] = "ebird"
 		}
 	}
 
@@ -238,14 +260,14 @@ func calculateRarityStatus(score float64) RarityStatus {
 
 // TaxonomyInfo represents detailed taxonomy information for a species
 type TaxonomyInfo struct {
-	ScientificName     string                 `json:"scientific_name"`
-	SpeciesCode        string                 `json:"species_code,omitempty"`
-	Taxonomy           *TaxonomyHierarchy     `json:"taxonomy,omitempty"`
-	Subspecies         []SubspeciesInfo       `json:"subspecies,omitempty"`
-	Synonyms           []string               `json:"synonyms,omitempty"`
-	ConservationStatus string                 `json:"conservation_status,omitempty"`
-	NativeRegions      []string               `json:"native_regions,omitempty"`
-	Metadata           map[string]interface{} `json:"metadata,omitempty"`
+	ScientificName     string             `json:"scientific_name"`
+	SpeciesCode        string             `json:"species_code,omitempty"`
+	Taxonomy           *TaxonomyHierarchy `json:"taxonomy,omitempty"`
+	Subspecies         []SubspeciesInfo   `json:"subspecies,omitempty"`
+	Synonyms           []string           `json:"synonyms,omitempty"`
+	ConservationStatus string             `json:"conservation_status,omitempty"`
+	NativeRegions      []string           `json:"native_regions,omitempty"`
+	Metadata           map[string]any     `json:"metadata,omitempty"`
 }
 
 // TaxonomyHierarchy represents the full taxonomic classification
@@ -292,7 +314,7 @@ func (c *Controller) GetSpeciesTaxonomy(ctx echo.Context) error {
 	// Get optional parameters
 	locale := ctx.QueryParam("locale")
 	includeSubspecies := ctx.QueryParam("include_subspecies") != "false" // default true
-	includeHierarchy := ctx.QueryParam("include_hierarchy") != "false"  // default true
+	includeHierarchy := ctx.QueryParam("include_hierarchy") != "false"   // default true
 
 	// Get taxonomy info
 	taxonomyInfo, err := c.getDetailedTaxonomy(ctx.Request().Context(), scientificName, locale, includeSubspecies, includeHierarchy)
@@ -307,16 +329,80 @@ func (c *Controller) GetSpeciesTaxonomy(ctx echo.Context) error {
 	return ctx.JSON(http.StatusOK, taxonomyInfo)
 }
 
-// getDetailedTaxonomy retrieves detailed taxonomy information from eBird
+// getDetailedTaxonomy retrieves detailed taxonomy information
+// Tries local database first, falls back to eBird API if needed
 func (c *Controller) getDetailedTaxonomy(ctx context.Context, scientificName, locale string, includeSubspecies, includeHierarchy bool) (*TaxonomyInfo, error) {
-	// Check if eBird client is available
-	if c.EBirdClient == nil {
-		return nil, errors.Newf("eBird integration not available").
-			Category(errors.CategoryConfiguration).
-			Component("api-species").
-			Build()
+	// Try local taxonomy database first
+	if c.TaxonomyDB != nil {
+		taxonomyTree, err := c.TaxonomyDB.BuildFamilyTree(scientificName)
+		if err == nil {
+			// Successfully retrieved from local database
+			info := &TaxonomyInfo{
+				ScientificName: scientificName,
+				Metadata: map[string]any{
+					"source":     "local",
+					"updated_at": c.TaxonomyDB.UpdatedAt,
+				},
+			}
+
+			// Add hierarchy if requested
+			if includeHierarchy && taxonomyTree != nil {
+				info.Taxonomy = &TaxonomyHierarchy{
+					Kingdom:       taxonomyTree.Kingdom,
+					Phylum:        taxonomyTree.Phylum,
+					Class:         taxonomyTree.Class,
+					Order:         taxonomyTree.Order,
+					Family:        taxonomyTree.Family,
+					FamilyCommon:  taxonomyTree.FamilyCommon,
+					Genus:         taxonomyTree.Genus,
+					Species:       taxonomyTree.Species,
+					SpeciesCommon: taxonomyTree.SpeciesCommon,
+				}
+			}
+
+			// If subspecies requested or locale specified, try to enhance with eBird data
+			if (includeSubspecies || locale != "") && c.EBirdClient != nil {
+				c.Debug("Enhancing local taxonomy data with eBird API for subspecies/locale")
+				ebirdInfo, ebirdErr := c.getEBirdTaxonomy(ctx, scientificName, locale, includeSubspecies)
+				if ebirdErr == nil {
+					// Merge eBird subspecies data
+					if includeSubspecies && len(ebirdInfo.Subspecies) > 0 {
+						info.Subspecies = ebirdInfo.Subspecies
+					}
+					// Use eBird species code if available
+					if ebirdInfo.SpeciesCode != "" {
+						info.SpeciesCode = ebirdInfo.SpeciesCode
+					}
+					// Update metadata to indicate hybrid source
+					info.Metadata["source"] = "local+ebird"
+					if locale != "" {
+						info.Metadata["locale"] = locale
+					}
+				}
+			}
+
+			return info, nil
+		}
+		// Local lookup failed, will try eBird API below
+		c.Debug("Local taxonomy lookup failed for %s: %v, falling back to eBird API", scientificName, err)
 	}
 
+	// Fall back to eBird API
+	if c.EBirdClient != nil {
+		return c.getEBirdTaxonomy(ctx, scientificName, locale, includeSubspecies)
+	}
+
+	// Neither local DB nor eBird API available
+	return nil, errors.Newf("taxonomy data not available (no local database or eBird API)").
+		Category(errors.CategoryConfiguration).
+		Priority(errors.PriorityLow).
+		Context("scientific_name", scientificName).
+		Component("api-species").
+		Build()
+}
+
+// getEBirdTaxonomy retrieves taxonomy information from eBird API
+func (c *Controller) getEBirdTaxonomy(ctx context.Context, scientificName, locale string, includeSubspecies bool) (*TaxonomyInfo, error) {
 	// Get full taxonomy data with locale if specified
 	taxonomyData, err := c.EBirdClient.GetTaxonomy(ctx, locale)
 	if err != nil {
@@ -344,33 +430,30 @@ func (c *Controller) getDetailedTaxonomy(ctx context.Context, scientificName, lo
 	info := &TaxonomyInfo{
 		ScientificName: speciesEntry.ScientificName,
 		SpeciesCode:    speciesEntry.SpeciesCode,
-		Metadata: map[string]interface{}{
+		Metadata: map[string]any{
 			"source":     "ebird",
 			"updated_at": time.Now().Format(time.RFC3339),
 			"locale":     locale,
 		},
 	}
 
-	// Add hierarchy if requested
-	if includeHierarchy {
-		// Parse genus from scientific name
-		parts := strings.Split(speciesEntry.ScientificName, " ")
-		genus := ""
-		if len(parts) > 0 {
-			genus = parts[0]
-		}
+	// Parse genus from scientific name
+	parts := strings.Fields(speciesEntry.ScientificName)
+	genus := ""
+	if len(parts) > 0 {
+		genus = parts[0]
+	}
 
-		info.Taxonomy = &TaxonomyHierarchy{
-			Kingdom:       "Animalia", // All birds are in kingdom Animalia
-			Phylum:        "Chordata", // All birds are in phylum Chordata
-			Class:         "Aves",     // All entries are birds
-			Order:         speciesEntry.Order,
-			Family:        speciesEntry.FamilySciName,
-			FamilyCommon:  speciesEntry.FamilyComName,
-			Genus:         genus,
-			Species:       speciesEntry.ScientificName,
-			SpeciesCommon: speciesEntry.CommonName,
-		}
+	info.Taxonomy = &TaxonomyHierarchy{
+		Kingdom:       "Animalia", // All birds are in kingdom Animalia
+		Phylum:        "Chordata", // All birds are in phylum Chordata
+		Class:         "Aves",     // All entries are birds
+		Order:         speciesEntry.Order,
+		Family:        speciesEntry.FamilySciName,
+		FamilyCommon:  speciesEntry.FamilyComName,
+		Genus:         genus,
+		Species:       speciesEntry.ScientificName,
+		SpeciesCommon: speciesEntry.CommonName,
 	}
 
 	// Add subspecies if requested and it's a species entry
@@ -392,7 +475,7 @@ func (c *Controller) findDetailedSubspecies(taxonomy []ebird.TaxonomyEntry, spec
 		// Check if this entry reports as our species and is a subspecies category
 		if taxonomy[i].ReportAs == speciesCode &&
 			(taxonomy[i].Category == "issf" || taxonomy[i].Category == "form") {
-			
+
 			// Extract region from common name if present (often in parentheses)
 			region := ""
 			commonName := taxonomy[i].CommonName
@@ -452,7 +535,7 @@ func (c *Controller) GetSpeciesThumbnail(ctx echo.Context) error {
 	// Get species name from the taxonomy map using the species code
 	bn := c.Processor.Bn
 	speciesName, exists := birdnet.GetSpeciesNameFromCode(bn.TaxonomyMap, speciesCode)
-	
+
 	if !exists {
 		return c.HandleError(ctx, errors.Newf("species code '%s' not found in taxonomy", speciesCode).
 			Category(errors.CategoryNotFound).
@@ -463,7 +546,7 @@ func (c *Controller) GetSpeciesThumbnail(ctx echo.Context) error {
 
 	// Split the species name to get scientific name
 	scientificName, _ := birdnet.SplitSpeciesName(speciesName)
-	
+
 	if scientificName == "" {
 		return c.HandleError(ctx, errors.Newf("invalid species name format for code '%s'", speciesCode).
 			Category(errors.CategoryValidation).

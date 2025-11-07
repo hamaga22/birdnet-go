@@ -1,6 +1,7 @@
 package processor
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -18,12 +19,25 @@ type MockDatastoreAdapter struct {
 	ds *datastore.DataStore
 }
 
-func (m *MockDatastoreAdapter) GetNewSpeciesDetections(startDate, endDate string, limit, offset int) ([]datastore.NewSpeciesData, error) {
-	return m.ds.GetNewSpeciesDetections(startDate, endDate, limit, offset)
+func (m *MockDatastoreAdapter) GetNewSpeciesDetections(ctx context.Context, startDate, endDate string, limit, offset int) ([]datastore.NewSpeciesData, error) {
+	return m.ds.GetNewSpeciesDetections(ctx, startDate, endDate, limit, offset)
 }
 
-func (m *MockDatastoreAdapter) GetSpeciesFirstDetectionInPeriod(startDate, endDate string, limit, offset int) ([]datastore.NewSpeciesData, error) {
-	return m.ds.GetSpeciesFirstDetectionInPeriod(startDate, endDate, limit, offset)
+func (m *MockDatastoreAdapter) GetSpeciesFirstDetectionInPeriod(ctx context.Context, startDate, endDate string, limit, offset int) ([]datastore.NewSpeciesData, error) {
+	return m.ds.GetSpeciesFirstDetectionInPeriod(ctx, startDate, endDate, limit, offset)
+}
+
+// BG-17 fix: Add notification history methods
+func (m *MockDatastoreAdapter) GetActiveNotificationHistory(after time.Time) ([]datastore.NotificationHistory, error) {
+	return m.ds.GetActiveNotificationHistory(after)
+}
+
+func (m *MockDatastoreAdapter) SaveNotificationHistory(history *datastore.NotificationHistory) error {
+	return m.ds.SaveNotificationHistory(history)
+}
+
+func (m *MockDatastoreAdapter) DeleteExpiredNotificationHistory(before time.Time) (int64, error) {
+	return m.ds.DeleteExpiredNotificationHistory(before)
 }
 
 // setupIntegrationTestDB creates a real SQLite database for integration testing
@@ -348,7 +362,7 @@ func TestIntegration_SeasonalTransitions(t *testing.T) {
 
 	t.Run("query for new species by season", func(t *testing.T) {
 		// Get new species in spring
-		springNew, err := ds.GetNewSpeciesDetections("2024-03-20", "2024-06-20", 10, 0)
+		springNew, err := ds.GetNewSpeciesDetections(context.Background(), "2024-03-20", "2024-06-20", 10, 0)
 		require.NoError(t, err)
 
 		springSpeciesMap := make(map[string]bool)
@@ -360,7 +374,7 @@ func TestIntegration_SeasonalTransitions(t *testing.T) {
 		assert.True(t, springSpeciesMap["Apus apus"], "Common Swift first seen in spring period")
 
 		// Get new species in summer
-		summerNew, err := ds.GetNewSpeciesDetections("2024-06-21", "2024-09-21", 10, 0)
+		summerNew, err := ds.GetNewSpeciesDetections(context.Background(), "2024-06-21", "2024-09-21", 10, 0)
 		require.NoError(t, err)
 
 		summerSpeciesMap := make(map[string]bool)

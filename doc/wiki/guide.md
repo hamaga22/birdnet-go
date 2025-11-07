@@ -204,6 +204,7 @@ realtime:
         maxage: 30d # Maximum age of audio clips to keep
         maxusage: 85% # Maximum disk usage percentage before cleanup
         minclips: 5 # Minimum number of clips per species to keep
+        checkInterval: 15 # Cleanup check interval in minutes (default: 15)
     equalizer:
       enabled: false # Enable equalizer filters
       filters:
@@ -359,7 +360,11 @@ webserver:
 # Security settings
 security:
   debug: false # Enable debug mode for security features
-  host: "" # Primary hostname used for TLS certificates and OAuth redirect URLs
+  host:
+    "" # Primary hostname used for TLS certificates, OAuth redirect URLs, and notification links
+    # Set this to your public hostname when using a reverse proxy (e.g., "birdnet.home.arpa")
+    # Can also be set via BIRDNET_HOST environment variable
+    # Falls back to "localhost" if not configured (works for direct access only)
   autotls: false # Enable automatic TLS certificate management using Let's Encrypt
   redirecttohttps: true # Redirect HTTP to HTTPS
   allowsubnetbypass:
@@ -964,46 +969,60 @@ realtime:
 
 ### Stage 3: Deep Detection Filter
 
-[Deep Detection](BirdNET‐Go-Guide#deep-detection) uses the `overlap` setting to require multiple detections of the same species within a 15-second window before accepting it, significantly reducing false positives.
+[Deep Detection](BirdNET‐Go-Guide#deep-detection) uses the `overlap` setting to require multiple detections of the same species within a configurable detection window before accepting it, significantly reducing false positives.
 
 #### How It Works:
 
-1. **Detection Holding**: All detections are held in a pending state for **exactly 15 seconds** from first detection
+1. **Detection Holding**: All detections are held in a pending state for `captureLength - preCaptureLength` seconds from first detection (defaults to 12 seconds with 15s clip length and 3s pre-capture buffer)
 2. **Counting Mechanism**: During this window, if the same species is detected again, a counter increments
-3. **Threshold Calculation**: The minimum required detections scales inversely with overlap:
+3. **Threshold Calculation**: The minimum required detections scales with both overlap and detection window duration:
 
 ```yaml
 birdnet:
   overlap: 2.7 # Enable deep detection (requires more CPU power)
+realtime:
+  audio:
+    export:
+      length: 15 # Audio clip length in seconds
+      preCapture: 3 # Pre-detection buffer in seconds
 ```
 
 **Exact Minimum Detections Calculation:**
 
 ```
+detectionWindow = captureLength - preCaptureLength
 segmentLength = max(0.1, 3.0 - overlap)
-minDetections = max(1, 3 / segmentLength)
+baseMinDetections = 3.0 / segmentLength
+scaleFactor = detectionWindow / 15.0
+minDetections = max(1, round(baseMinDetections * scaleFactor))
 
-Examples:
+Examples (with default 12-second detection window):
 - overlap: 0.0  → segmentLength: 3.0  → minDetections: 1  (standard mode)
 - overlap: 1.5  → segmentLength: 1.5  → minDetections: 2
-- overlap: 2.7  → segmentLength: 0.3  → minDetections: 10 (deep detection)
-- overlap: 2.9  → segmentLength: 0.1  → minDetections: 30 (very strict)
+- overlap: 2.4  → segmentLength: 0.6  → minDetections: 4  (recommended)
+- overlap: 2.7  → segmentLength: 0.3  → minDetections: 8  (deep detection)
+- overlap: 2.9  → segmentLength: 0.1  → minDetections: 24 (very strict)
+
+With longer detection window (30s clip, 0s pre-capture = 30s window):
+- overlap: 2.4  → minDetections: 10 (2x baseline)
+- overlap: 2.7  → minDetections: 20 (2x baseline)
 ```
 
 #### Processing Timeline:
 
-1. **0 seconds**: Species detected for first time, 15-second timer starts
-2. **0-15 seconds**: Additional detections increment the counter
-3. **15 seconds**: Decision point reached:
+1. **0 seconds**: Species detected for first time, detection window timer starts
+2. **0 to detectionWindow seconds**: Additional detections increment the counter
+3. **detectionWindow seconds**: Decision point reached:
    - **If count ≥ minDetections**: Detection approved and processed
    - **If count < minDetections**: Detection discarded as "false positive"
 
 #### Key Behavior Notes:
 
-- **Hard 15-second timeout**: Detections are **always** decided after exactly 15 seconds
-- **No early approval**: Even if minimum detections are met before 15 seconds, the system waits for the full window
+- **Configurable timeout**: Detection window duration is `captureLength - preCaptureLength` (prevents audio clip gaps)
+- **No early approval**: Even if minimum detections are met early, the system waits for the full window
 - **Quality improvement**: Higher confidence detections within the window replace lower ones
 - **Memory efficient**: Only one pending detection per species is held at a time
+- **Runtime adaptable**: Changes to overlap, clip length, or pre-capture settings take effect within 1 second
 
 ### Stage 4: Privacy and Behavioral Filters
 
@@ -1304,7 +1323,7 @@ BirdNET-Go offers advanced audio processing capabilities:
 
 If you enable audio clip exporting (`realtime.audio.export.enabled: true`), BirdNET-Go can automatically manage disk space by deleting older recordings based on configured retention policies. This prevents your disk from filling up over time.
 
-The cleanup task runs periodically (every few minutes) to check if clips need to be deleted based on the selected policy.
+The cleanup task runs periodically to check if clips need to be deleted based on the selected policy. The check interval is configurable to balance between timely cleanup and system resource usage.
 
 Configure these options under `realtime.audio.export.retention` in your `config.yaml`:
 
@@ -1315,6 +1334,7 @@ Configure these options under `realtime.audio.export.retention` in your `config.
 - **`maxage`**: (Used with `policy: age`) Maximum age for clips (e.g., `30d` for 30 days, `7d` for 7 days, `24h` for 24 hours). Clips older than this will be deleted.
 - **`maxusage`**: (Used with `policy: usage`) The target maximum disk usage percentage (e.g., `85%`). Cleanup triggers when usage exceeds this threshold.
 - **`minclips`**: (Used with `policy: usage`) The minimum number of clips to keep for each species, even when cleaning up based on disk usage. This ensures you retain at least some recent examples per species.
+- **`checkInterval`**: How often to check if cleanup is needed, in minutes (default: 15). Higher values reduce CPU/IO overhead but may delay cleanup. For usage-based policy, disk usage is checked first before scanning files, so setting this too low won't waste resources when disk usage is below threshold.
 
 ### Security Features
 
@@ -1361,7 +1381,7 @@ BirdNET-Go supports OAuth2 authentication with Google and GitHub for secure acce
    - In your BirdNET-Go web interface, go to Settings → Security
    - Enable Google OAuth and enter:
      - **Client ID**: Your Google OAuth Client ID
-     - **Client Secret**: Your Google OAuth Client Secret  
+     - **Client Secret**: Your Google OAuth Client Secret
      - **User ID** (optional): Restrict access to specific Google account by entering the user's email address
 
 ##### GitHub OAuth Setup
@@ -1394,20 +1414,20 @@ BirdNET-Go supports OAuth2 authentication with Google and GitHub for secure acce
 
 ```yaml
 security:
-  host: "yourdomain.com"  # Your domain for HTTPS
-  autotls: true          # Enable automatic HTTPS certificates
-  
+  host: "yourdomain.com" # Your domain for HTTPS
+  autotls: true # Enable automatic HTTPS certificates
+
   googleauth:
     enabled: true
     clientid: "123456789-abcdefghijklmnop.apps.googleusercontent.com"
     clientsecret: "GOCSPX-your-secret-key-here"
-    userid: "user@gmail.com"  # Optional: restrict to specific user
-  
+    userid: "user@gmail.com" # Optional: restrict to specific user
+
   githubauth:
     enabled: true
     clientid: "Ov23liABCDEFGHIJ1234"
     clientsecret: "your-github-secret-key-here"
-    userid: "yourusername"    # Optional: restrict to specific user
+    userid: "yourusername" # Optional: restrict to specific user
 ```
 
 **Environment variables** (Docker):
@@ -1435,15 +1455,18 @@ BIRDNET_SECURITY_GITHUBAUTH_USERID=yourusername
 ##### Troubleshooting OAuth
 
 **"Invalid redirect URI" errors**:
+
 - Ensure your callback URL in the OAuth app configuration exactly matches the format shown in BirdNET-Go settings
 - Check that the protocol (http/https) and port number are correct
 - The callback URL should end with `/auth/google/callback` or `/auth/github/callback`
 
 **"Access blocked" errors**:
+
 - For Google OAuth: Ensure your app is verified or add your email to test users
 - For GitHub OAuth: Verify the OAuth app is active and the callback URL is correct
 
 **Login button not appearing**:
+
 - Check that OAuth is enabled in BirdNET-Go settings
 - Verify your client ID and client secret are correctly configured
 - Check the browser console for JavaScript errors
@@ -1970,6 +1993,667 @@ Advanced users interested in extending the sound level monitoring capabilities s
 5. **Peak Detection**: True peak tracking would require additional buffer management
 
 The implementation provides a solid foundation for environmental sound monitoring with robust signal processing and comprehensive error handling. While it cannot provide absolute SPL measurements, it excels at relative sound level monitoring and frequency analysis for research and environmental assessment purposes.
+
+### Push Notifications
+
+BirdNET-Go includes a comprehensive push notification system that can send real-time alerts about bird detections, system errors, and important events to your preferred notification services. This feature enables you to stay informed about what's happening at your monitoring station even when you're away from the web interface.
+
+#### Overview
+
+The push notification system supports multiple delivery methods (providers) and can be configured to send different types of notifications to different services based on priority, type, or custom filters. Each provider operates independently with built-in resilience features like automatic retries, circuit breakers, and rate limiting.
+
+#### Configuring Notification URLs
+
+Push notifications for new bird detections include clickable links to view the detection details in the web interface. To ensure these URLs work correctly when accessing BirdNET-Go through a reverse proxy or from remote locations, you need to configure the hostname:
+
+**Configuration Methods (in priority order):**
+
+1. **Config file** - Set `security.host` in your `config.yaml`:
+
+   ```yaml
+   security:
+     host: "birdnet.home.arpa" # Your public hostname
+   ```
+
+2. **Environment variable** - Set `BIRDNET_HOST` (useful for Docker):
+
+   ```bash
+   export BIRDNET_HOST=birdnet.home.arpa
+   # or with Docker:
+   docker run -e BIRDNET_HOST=birdnet.home.arpa tphakala/birdnet-go
+   ```
+
+3. **Localhost fallback** - If neither is set, URLs will use `localhost` (works only for direct local access)
+
+**Docker Compose Example:**
+
+```yaml
+services:
+  birdnet-go:
+    image: tphakala/birdnet-go:nightly
+    environment:
+      - BIRDNET_HOST=birdnet.home.arpa # Set your hostname here
+      - TZ=US/Eastern
+    # ... rest of configuration
+```
+
+**Why This Matters:**
+
+Without proper hostname configuration, notification URLs will show as `http://localhost:8080/ui/detections/12345`, which won't work when clicked from a phone or remote device. With the hostname configured, URLs will correctly show as `http://birdnet.home.arpa/ui/detections/12345`.
+
+> **Note**: A warning will be logged if BirdNET-Go falls back to using localhost for notification URLs. Configure the hostname using either method above to resolve this warning.
+
+#### Supported Providers
+
+BirdNET-Go supports three types of push notification providers:
+
+##### 1. Shoutrrr (Multi-Service)
+
+The [Shoutrrr](https://containrrr.dev/shoutrrr/) provider supports 20+ notification services through a unified URL format, including:
+
+- **Messaging Apps**: Telegram, Discord, Slack, Matrix, Mattermost, Zulip
+- **Push Services**: Pushover, Pushbullet, Ntfy
+- **Email**: SMTP, SendGrid, Mailgun
+- **Smart Home**: Home Assistant, Gotify
+- **Incident Management**: Opsgenie, PagerDuty
+- **Voice**: Bark (iOS)
+
+**Configuration Example:**
+
+```yaml
+notification:
+  push:
+    enabled: true
+    default_timeout: 30s
+    max_retries: 3
+    retry_delay: 5s
+
+    providers:
+      - type: shoutrrr
+        enabled: true
+        name: "telegram-alerts"
+        urls:
+          - "telegram://<YOUR_BOT_TOKEN>@telegram?chats=<YOUR_CHAT_ID>"
+        timeout: 10s
+        filter:
+          types: ["error", "detection"]
+          priorities: ["critical", "high"]
+```
+
+**Shoutrrr URL Format:**
+
+Each service has its own URL format. Common examples:
+
+- **Telegram**: `telegram://<bot_token>@telegram?chats=<chat_id>`
+- **Discord**: `discord://<webhook_token>@<webhook_id>`
+- **Slack**: `slack://token-a/token-b/token-c`
+- **Email**: `smtp://username:password@host:port/?from=sender@example.com&to=recipient@example.com`
+- **Pushover**: `pushover://shoutrrr:<api_token>@<user_key>`
+
+For complete URL format documentation, see the [Shoutrrr documentation](https://containrrr.dev/shoutrrr/v0.8/services/overview/).
+
+##### 2. Webhook (Custom HTTP)
+
+The webhook provider sends notifications as HTTP requests to custom endpoints, ideal for integrating with your own services, APIs, or automation platforms.
+
+**Features:**
+
+- Supports POST, PUT, and PATCH methods
+- Multiple authentication types (Bearer, Basic, Custom headers)
+- Custom JSON templates
+- Multiple endpoints with failover
+- Secure secret management (environment variables and files)
+
+**Configuration Example:**
+
+```yaml
+notification:
+  push:
+    providers:
+      - type: webhook
+        enabled: true
+        name: "api-service"
+        endpoints:
+          - url: "https://api.example.com/webhooks/birdnet"
+            method: POST
+            timeout: 10s
+            headers:
+              Content-Type: "application/json"
+            auth:
+              type: bearer
+              token: "${API_TOKEN}" # Reads from environment variable
+        filter:
+          types: ["detection"]
+          metadata_filters:
+            confidence: ">0.8"
+```
+
+**Authentication Types:**
+
+1. **Bearer Token** (recommended for most APIs):
+
+```yaml
+auth:
+  type: bearer
+  token: "${API_TOKEN}" # From environment variable
+  # OR
+  token_file: "/run/secrets/api_token" # From file (Kubernetes/Docker Swarm)
+```
+
+2. **Basic Authentication**:
+
+```yaml
+auth:
+  type: basic
+  user: "${API_USER}"
+  pass: "${API_PASSWORD}"
+```
+
+3. **Custom Header**:
+
+```yaml
+auth:
+  type: custom
+  header: "X-API-Key"
+  value: "${API_KEY}"
+```
+
+**Custom JSON Template:**
+
+You can customize the JSON payload sent to your webhook:
+
+```yaml
+template: |
+  {
+    "event": "{{.Type}}",
+    "severity": "{{.Priority}}",
+    "bird": "{{.Title}}",
+    "details": "{{.Message}}",
+    "time": "{{.Timestamp}}",
+    "confidence": {{.Metadata.confidence}}
+  }
+```
+
+Available template fields:
+
+- `{{.ID}}` - Notification unique ID
+- `{{.Type}}` - Notification type (error, warning, info, detection, system)
+- `{{.Priority}}` - Priority level (critical, high, medium, low)
+- `{{.Title}}` - Notification title
+- `{{.Message}}` - Notification message
+- `{{.Component}}` - Component that generated the notification
+- `{{.Timestamp}}` - ISO 8601 timestamp
+- `{{.Metadata.key}}` - Any metadata field (e.g., confidence, species)
+
+##### 3. Script (Custom Scripts)
+
+The script provider executes custom shell scripts or programs, allowing complete control over notification handling. Perfect for custom integrations, logging, or triggering actions based on detections.
+
+**Configuration Example:**
+
+```yaml
+notification:
+  push:
+    providers:
+      - type: script
+        enabled: true
+        name: "custom-handler"
+        command: "/usr/local/bin/notify.sh"
+        args: ["--mode", "production"]
+        environment:
+          SLACK_WEBHOOK: "${SLACK_WEBHOOK_URL}"
+          LOG_PATH: "/var/log/birdnet"
+        input_format: both # "json", "env", or "both"
+        filter:
+          types: ["detection"]
+          priorities: ["high", "critical"]
+```
+
+**Input Formats:**
+
+- **`env`**: Data passed only through environment variables
+- **`json`**: Data passed as JSON on stdin
+- **`both`**: Data passed via both environment variables and JSON stdin
+
+**Environment Variables Provided:**
+
+When your script runs, these variables are automatically set:
+
+- `NOTIFICATION_ID` - Unique identifier
+- `NOTIFICATION_TYPE` - error, warning, info, detection, or system
+- `NOTIFICATION_PRIORITY` - critical, high, medium, or low
+- `NOTIFICATION_TITLE` - Notification title
+- `NOTIFICATION_MESSAGE` - Notification message
+- `NOTIFICATION_COMPONENT` - Source component
+- `NOTIFICATION_TIMESTAMP` - ISO 8601 timestamp
+- `NOTIFICATION_METADATA_JSON` - JSON string of metadata
+
+**Example Script:**
+
+```bash
+#!/bin/bash
+# notify.sh - Example notification handler
+
+# Read environment variables
+TYPE="$NOTIFICATION_TYPE"
+TITLE="$NOTIFICATION_TITLE"
+MESSAGE="$NOTIFICATION_MESSAGE"
+
+# Read JSON from stdin if input_format is "json" or "both"
+if [ "$INPUT_FORMAT" != "env" ]; then
+    JSON=$(cat)
+    # Parse JSON with jq if available
+    CONFIDENCE=$(echo "$JSON" | jq -r '.metadata.confidence // "N/A"')
+fi
+
+# Custom logic based on notification type
+case "$TYPE" in
+    detection)
+        echo "[$(date)] Bird detected: $TITLE (confidence: $CONFIDENCE)" >> /var/log/birds.log
+        # Send to custom service
+        curl -X POST "$SLACK_WEBHOOK" -d "{\"text\":\"$TITLE detected!\"}"
+        ;;
+    error)
+        echo "[$(date)] ERROR: $MESSAGE" >> /var/log/errors.log
+        # Send alert
+        ;;
+esac
+
+exit 0
+```
+
+#### Notification Filters
+
+Filters control which notifications are sent to each provider. You can filter by type, priority, component, or custom metadata fields.
+
+##### Filter by Type
+
+Limit notifications to specific types:
+
+```yaml
+filter:
+  types: ["error", "detection"] # Only errors and detections
+```
+
+Available types:
+
+- `error` - System errors and failures
+- `warning` - Warnings and potential issues
+- `info` - Informational messages
+- `detection` - Bird detection events
+- `system` - System status changes
+
+##### Filter by Priority
+
+Limit notifications to specific priority levels:
+
+```yaml
+filter:
+  priorities: ["critical", "high"] # Only urgent notifications
+```
+
+Available priorities:
+
+- `critical` - Immediate action required
+- `high` - Important but not urgent
+- `medium` - Normal priority
+- `low` - Informational only
+
+##### Filter by Component
+
+Limit notifications from specific system components:
+
+```yaml
+filter:
+  components: ["birdnet", "audio"] # Only BirdNET and audio components
+```
+
+##### Filter by Metadata
+
+Filter based on notification metadata, including confidence thresholds for bird detections:
+
+```yaml
+filter:
+  metadata_filters:
+    confidence: ">0.8" # Only high-confidence detections
+    species: "Northern Cardinal" # Only specific species
+```
+
+**Confidence Operators:**
+
+- `>` - Greater than (e.g., `">0.8"`)
+- `>=` - Greater than or equal to (e.g., `">=0.75"`)
+- `<` - Less than (e.g., `"<0.5"`)
+- `<=` - Less than or equal to (e.g., `"<=0.6"`)
+- `=` or `==` - Equal to (e.g., `"=0.9"`)
+
+**Example: High-Confidence Rare Species Alerts:**
+
+```yaml
+filter:
+  types: ["detection"]
+  priorities: ["high", "critical"]
+  metadata_filters:
+    confidence: ">=0.85" # Only 85%+ confidence
+```
+
+#### Advanced Configuration
+
+##### Circuit Breaker
+
+The circuit breaker automatically disables failing providers temporarily to prevent cascading failures:
+
+```yaml
+notification:
+  push:
+    circuit_breaker:
+      enabled: true
+      max_failures: 5 # Failures before circuit opens
+      timeout: 30s # Time before retry attempt
+      half_open_max_requests: 1 # Test requests in half-open state
+```
+
+**How it works:**
+
+1. **Closed** (normal): All requests pass through
+2. **Open** (after max_failures): All requests blocked
+3. **Half-Open** (after timeout): Limited test requests allowed
+4. **Returns to Closed**: If test requests succeed
+
+##### Health Checks
+
+Periodic health checks verify provider availability:
+
+```yaml
+notification:
+  push:
+    health_check:
+      enabled: true
+      interval: 60s # Check every minute
+      timeout: 10s # Health check timeout
+```
+
+##### Rate Limiting
+
+Prevents overwhelming external APIs with too many requests:
+
+```yaml
+notification:
+  push:
+    rate_limiting:
+      enabled: true
+      requests_per_minute: 60 # Average request rate
+      burst_size: 10 # Maximum burst capacity
+```
+
+> **Note**: Rate limiting is disabled by default. Circuit breakers usually provide sufficient protection.
+
+#### Complete Configuration Example
+
+Here's a complete example showing multiple providers with different filters:
+
+```yaml
+notification:
+  push:
+    enabled: true
+    default_timeout: 30s
+    max_retries: 3
+    retry_delay: 5s
+
+    # Protection features
+    circuit_breaker:
+      enabled: true
+      max_failures: 5
+      timeout: 30s
+      half_open_max_requests: 1
+
+    health_check:
+      enabled: true
+      interval: 60s
+      timeout: 10s
+
+    rate_limiting:
+      enabled: false # Use circuit breakers instead
+
+    providers:
+      # Telegram: Critical errors and high-confidence detections
+      - type: shoutrrr
+        enabled: true
+        name: "telegram-critical"
+        urls:
+          - "telegram://${TELEGRAM_BOT_TOKEN}@telegram?chats=${TELEGRAM_CHAT_ID}"
+        timeout: 10s
+        filter:
+          types: ["error", "detection"]
+          priorities: ["critical", "high"]
+          metadata_filters:
+            confidence: ">0.9"
+
+      # Webhook: All detections for data analysis
+      - type: webhook
+        enabled: true
+        name: "analysis-api"
+        endpoints:
+          - url: "https://api.example.com/birds"
+            auth:
+              type: bearer
+              token: "${API_TOKEN}"
+        filter:
+          types: ["detection"]
+
+      # Script: Rare species alerts with custom handling
+      - type: script
+        enabled: true
+        name: "rare-bird-alert"
+        command: "/usr/local/bin/rare_bird_notify.sh"
+        input_format: both
+        filter:
+          types: ["detection"]
+          priorities: ["high", "critical"]
+          metadata_filters:
+            confidence: ">=0.85"
+
+      # Discord: System status updates
+      - type: shoutrrr
+        enabled: true
+        name: "discord-status"
+        urls:
+          - "discord://${DISCORD_WEBHOOK_TOKEN}@${DISCORD_WEBHOOK_ID}"
+        filter:
+          types: ["system", "warning"]
+```
+
+#### Security Best Practices
+
+**1. Never Commit Secrets**
+
+Always use environment variables or secret files for sensitive data:
+
+```yaml
+# ❌ NEVER do this (hardcoded secret)
+token: "123456789:ABCdefGHIjklMNOpqrsTUVwxyz"
+
+# ✅ DO this (environment variable)
+token: "${TELEGRAM_BOT_TOKEN}"
+
+# ✅ OR this (secret file)
+token_file: "/run/secrets/telegram_token"
+```
+
+**2. Environment Variables**
+
+Set environment variables when running BirdNET-Go:
+
+```bash
+# Docker
+docker run -e TELEGRAM_BOT_TOKEN="your-token" birdnet-go
+
+# Docker Compose
+echo "TELEGRAM_BOT_TOKEN=your-token" > .env
+
+# Binary
+export TELEGRAM_BOT_TOKEN="your-token"
+./birdnet-go realtime
+```
+
+**3. Secret Files (Kubernetes/Docker Swarm)**
+
+For orchestrated deployments, mount secrets as files:
+
+```yaml
+# Kubernetes
+apiVersion: v1
+kind: Secret
+metadata:
+  name: birdnet-secrets
+stringData:
+  telegram-token: "your-token"
+
+# Then reference in config
+token_file: "/run/secrets/telegram-token"
+```
+
+**4. File Permissions**
+
+Ensure secret files have restrictive permissions:
+
+```bash
+chmod 0400 /path/to/secret  # Read-only for owner
+```
+
+#### Troubleshooting
+
+##### Common Issues
+
+**Notifications Not Sending:**
+
+1. Check provider is enabled: `enabled: true`
+2. Verify filter settings aren't too restrictive
+3. Check logs for error messages
+4. Test authentication credentials
+5. Verify network connectivity
+
+**Circuit Breaker Blocking Requests:**
+
+- Circuit breaker opens after repeated failures
+- Wait for timeout period (default 30s)
+- Check provider configuration and credentials
+- Review logs for underlying errors
+
+**Shoutrrr URL Errors:**
+
+- Verify URL format matches service documentation
+- Test URL with `shoutrrr send` CLI tool
+- Check special characters are properly encoded
+- Ensure bot tokens and IDs are correct
+
+**Script Provider Not Working:**
+
+1. Verify script has execute permissions: `chmod +x script.sh`
+2. Check script path is absolute
+3. Test script manually with environment variables
+4. Review script exit codes (0 = success)
+5. Check script logs/output
+
+**Webhook Authentication Failing:**
+
+- Verify environment variables are set correctly
+- Check secret file paths and permissions
+- Test webhook endpoint with curl:
+  ```bash
+  curl -H "Authorization: Bearer YOUR_TOKEN" \
+       -X POST https://api.example.com/webhook \
+       -d '{"test": true}'
+  ```
+- Review API provider documentation
+
+##### Debug Logging
+
+Enable debug logging to troubleshoot issues:
+
+```yaml
+debug: true # Enable global debug logging
+
+notification:
+  push:
+    enabled: true
+    # ... rest of config
+```
+
+Debug logs will show:
+
+- Provider initialization
+- Filter evaluation decisions
+- Circuit breaker state changes
+- Retry attempts
+- Detailed error messages
+
+#### Use Case Examples
+
+##### 1. Rare Species Alerts to Phone
+
+Send immediate alerts for rare species with high confidence:
+
+```yaml
+- type: shoutrrr
+  enabled: true
+  name: "rare-bird-phone"
+  urls:
+    - "pushover://shoutrrr:${PUSHOVER_TOKEN}@${PUSHOVER_USER}"
+  filter:
+    types: ["detection"]
+    priorities: ["high", "critical"]
+    metadata_filters:
+      confidence: ">0.85"
+```
+
+##### 2. Error Monitoring to Team Chat
+
+Send system errors to team Slack channel:
+
+```yaml
+- type: shoutrrr
+  enabled: true
+  name: "team-slack"
+  urls:
+    - "slack://${SLACK_TOKEN_A}/${SLACK_TOKEN_B}/${SLACK_TOKEN_C}"
+  filter:
+    types: ["error", "warning"]
+    priorities: ["critical", "high"]
+```
+
+##### 3. Data Pipeline Integration
+
+Send all detections to data analysis API:
+
+```yaml
+- type: webhook
+  enabled: true
+  name: "data-pipeline"
+  endpoints:
+    - url: "https://data.example.com/ingest"
+      auth:
+        type: bearer
+        token: "${DATA_API_TOKEN}"
+  filter:
+    types: ["detection"]
+```
+
+##### 4. Custom Home Automation
+
+Trigger custom actions via script (turn on lights, play sounds, etc.):
+
+```yaml
+- type: script
+  enabled: true
+  name: "home-automation"
+  command: "/home/automation/bird_detected.sh"
+  input_format: env
+  filter:
+    types: ["detection"]
+    metadata_filters:
+      confidence: ">0.75"
+```
 
 ### Species Tracking System
 

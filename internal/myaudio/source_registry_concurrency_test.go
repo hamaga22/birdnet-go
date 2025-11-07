@@ -29,7 +29,7 @@ func TestRaceConditionFix(t *testing.T) {
 	results := make(chan string, numGoroutines)
 	var wg sync.WaitGroup
 
-	for i := 0; i < numGoroutines; i++ {
+	for range numGoroutines {
 		wg.Go(func() {
 			source := registry.GetOrCreateSource(testURL, SourceTypeRTSP)
 			var id string
@@ -293,7 +293,7 @@ func TestConcurrentMigrationAndCleanup(t *testing.T) {
 	t.Attr("component", "source-registry")
 	t.Attr("test-type", "concurrency")
 
-	synctest.Test(t, func(t *testing.T) { //nolint:thelper // Test body, not a helper
+	synctest.Test(t, func(t *testing.T) {
 		registry := GetRegistry()
 
 		// Clear any existing sources
@@ -309,7 +309,7 @@ func TestConcurrentMigrationAndCleanup(t *testing.T) {
 		var creatorsStarted sync.WaitGroup
 
 		// Half the goroutines create sources
-		for i := 0; i < numOperations; i++ {
+		for i := range numOperations {
 			id := i
 			creatorsStarted.Add(1)
 			wg.Go(func() {
@@ -326,7 +326,7 @@ func TestConcurrentMigrationAndCleanup(t *testing.T) {
 		})
 
 		// Other half try to remove sources - wait for start signal
-		for i := 0; i < numOperations; i++ {
+		for i := range numOperations {
 			id := i
 			wg.Go(func() {
 				<-startCh // Wait for creators to start before proceeding

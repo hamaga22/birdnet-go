@@ -2,12 +2,14 @@
 package datastore
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/tphakala/birdnet-go/internal/conf"
 	"github.com/tphakala/birdnet-go/internal/errors"
+	"gorm.io/gorm"
 )
 
 // isDebugLoggingEnabled returns true if debug logging is enabled and logger is available
@@ -57,7 +59,11 @@ type NewSpeciesData struct {
 
 // GetSpeciesSummaryData retrieves overall statistics for all bird species
 // Optional date range filtering with startDate and endDate parameters in YYYY-MM-DD format
-func (ds *DataStore) GetSpeciesSummaryData(startDate, endDate string) ([]SpeciesSummaryData, error) {
+//
+// NOTE: Uses a read-only transaction with repeatable read isolation to prevent race conditions
+// when concurrent writes are occurring. This ensures consistent timestamps even when new species
+// are being inserted. See issue #1239 for details on the SQLite WAL mode race condition.
+func (ds *DataStore) GetSpeciesSummaryData(ctx context.Context, startDate, endDate string) ([]SpeciesSummaryData, error) {
 	// Pre-allocate with reasonable capacity for typical species count
 	summaries := make([]SpeciesSummaryData, 0, 100)
 
@@ -92,8 +98,8 @@ func (ds *DataStore) GetSpeciesSummaryData(startDate, endDate string) ([]Species
 	queryStr := fmt.Sprintf(`
 		SELECT
 			scientific_name,
-			MAX(common_name) as common_name,
-			MAX(species_code) as species_code,
+			COALESCE(MAX(common_name), '') as common_name,
+			COALESCE(MAX(species_code), '') as species_code,
 			COUNT(*) as count,
 			MIN(%s) as first_seen,
 			MAX(%s) as last_seen,
@@ -104,7 +110,7 @@ func (ds *DataStore) GetSpeciesSummaryData(startDate, endDate string) ([]Species
 
 	// Add WHERE clause if date filters are provided
 	var whereClause string
-	var args []interface{}
+	var args []any
 
 	switch {
 	case startDate != "" && endDate != "":
@@ -124,99 +130,139 @@ func (ds *DataStore) GetSpeciesSummaryData(startDate, endDate string) ([]Species
 		ORDER BY count DESC
 	`
 
-	// Execute the query
+	// Execute the query within a read-only transaction for consistent snapshot isolation
+	// This prevents race conditions where partial writes are visible during concurrent inserts
+	// For SQLite with WAL mode: provides a consistent snapshot view even during concurrent writes
+	// For MySQL: uses default REPEATABLE READ isolation level for snapshot consistency
 	if isDebugLoggingEnabled() {
-		getLogger().Debug("GetSpeciesSummaryData: Executing query",
+		getLogger().Debug("GetSpeciesSummaryData: Executing query with snapshot isolation",
 			"query", queryStr,
 			"args", args)
 	}
-	rows, err := ds.DB.Raw(queryStr, args...).Rows()
+
+	// Add timeout to prevent indefinite execution
+	// Use 30 seconds as a reasonable upper bound for analytics queries
+	ctxWithTimeout, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	// Track transaction duration for performance monitoring
+	txStart := time.Now()
+
+	// Use GORM's Transaction helper for automatic commit/rollback handling
+	err := ds.DB.WithContext(ctxWithTimeout).Transaction(func(tx *gorm.DB) error {
+		// Execute query within transaction
+		rows, err := tx.Raw(queryStr, args...).Rows()
+		if err != nil {
+			return dbError(err, "get_species_summary_data", errors.PriorityMedium,
+				"start_date", startDate,
+				"end_date", endDate,
+				"action", "generate_species_analytics_report")
+		}
+		defer func() {
+			if err := rows.Close(); err != nil {
+				getLogger().Error("Failed to close rows",
+					"error", err,
+					"operation", "get_species_summary_data")
+			}
+		}()
+
+		queryExecutionTime := time.Since(queryStart)
+		if isDebugLoggingEnabled() {
+			getLogger().Debug("GetSpeciesSummaryData: Query executed, scanning rows",
+				"query_duration_ms", queryExecutionTime.Milliseconds())
+		}
+		rowCount := 0
+
+		// NOTE: Transaction has 30-second timeout at the top level (ctxWithTimeout)
+		// TODO(context-deadline): For very large result sets, consider adding context checks in loop
+		// Example: select { case <-ctxWithTimeout.Done(): rows.Close(); return ctxWithTimeout.Err(); default: }
+		// TODO(telemetry): Report context cancellations during row processing to internal/telemetry
+		for rows.Next() {
+			rowCount++
+			var summary SpeciesSummaryData
+			var firstSeenStr, lastSeenStr string
+
+			if err := rows.Scan(
+				&summary.ScientificName,
+				&summary.CommonName,
+				&summary.SpeciesCode,
+				&summary.Count,
+				&firstSeenStr,
+				&lastSeenStr,
+				&summary.AvgConfidence,
+				&summary.MaxConfidence,
+			); err != nil {
+				return dbError(err, "scan_species_summary_data", errors.PriorityLow,
+					"action", "parse_analytics_query_results")
+			}
+
+			// Parse time strings to time.Time
+			// IMPORTANT: Database stores local time strings, parse as local time
+			if firstSeenStr != "" {
+				firstSeen, err := time.ParseInLocation("2006-01-02 15:04:05", firstSeenStr, time.Local)
+				if err == nil {
+					summary.FirstSeen = firstSeen
+				} else if isDebugLoggingEnabled() {
+					datastoreLogger.Debug("Failed to parse firstSeen time",
+						"species", summary.ScientificName,
+						"firstSeenStr", firstSeenStr,
+						"error", err)
+				}
+			}
+
+			if lastSeenStr != "" {
+				lastSeen, err := time.ParseInLocation("2006-01-02 15:04:05", lastSeenStr, time.Local)
+				if err == nil {
+					summary.LastSeen = lastSeen
+				} else if isDebugLoggingEnabled() {
+					datastoreLogger.Debug("Failed to parse lastSeen time",
+						"species", summary.ScientificName,
+						"lastSeenStr", lastSeenStr,
+						"error", err)
+				}
+			}
+
+			summaries = append(summaries, summary)
+		}
+
+		// Check for errors from row iteration
+		if err := rows.Err(); err != nil {
+			return dbError(err, "iterate_species_summary_rows", errors.PriorityLow,
+				"action", "process_analytics_results")
+		}
+
+		// Log transaction metrics
+		txDuration := time.Since(txStart)
+		if isDebugLoggingEnabled() {
+			getLogger().Debug("GetSpeciesSummaryData: Transaction completed",
+				"tx_duration_ms", txDuration.Milliseconds(),
+				"rows_processed", rowCount)
+		}
+
+		return nil
+	})
+
 	if err != nil {
-		return nil, dbError(err, "get_species_summary_data", errors.PriorityMedium,
-			"start_date", startDate,
-			"end_date", endDate,
-			"action", "generate_species_analytics_report")
-	}
-	defer func() {
-		if err := rows.Close(); err != nil {
-			getLogger().Error("Failed to close rows",
-				"error", err,
-				"operation", "get_species_summary_data")
-		}
-	}()
-
-	queryExecutionTime := time.Since(queryStart)
-	if isDebugLoggingEnabled() {
-		getLogger().Debug("GetSpeciesSummaryData: Query executed, scanning rows",
-			"query_duration_ms", queryExecutionTime.Milliseconds())
-	}
-	rowCount := 0
-
-	for rows.Next() {
-		rowCount++
-		var summary SpeciesSummaryData
-		var firstSeenStr, lastSeenStr string
-
-		if err := rows.Scan(
-			&summary.ScientificName,
-			&summary.CommonName,
-			&summary.SpeciesCode,
-			&summary.Count,
-			&firstSeenStr,
-			&lastSeenStr,
-			&summary.AvgConfidence,
-			&summary.MaxConfidence,
-		); err != nil {
-			return nil, dbError(err, "scan_species_summary_data", errors.PriorityLow,
-				"action", "parse_analytics_query_results")
-		}
-
-		// Parse time strings to time.Time
-		// IMPORTANT: Database stores local time strings, parse as local time
-		if firstSeenStr != "" {
-			firstSeen, err := time.ParseInLocation("2006-01-02 15:04:05", firstSeenStr, time.Local)
-			if err == nil {
-				summary.FirstSeen = firstSeen
-			} else if isDebugLoggingEnabled() {
-				datastoreLogger.Debug("Failed to parse firstSeen time", 
-					"species", summary.ScientificName,
-					"firstSeenStr", firstSeenStr,
-					"error", err)
-			}
-		}
-
-		if lastSeenStr != "" {
-			lastSeen, err := time.ParseInLocation("2006-01-02 15:04:05", lastSeenStr, time.Local)
-			if err == nil {
-				summary.LastSeen = lastSeen
-			} else if isDebugLoggingEnabled() {
-				datastoreLogger.Debug("Failed to parse lastSeen time", 
-					"species", summary.ScientificName,
-					"lastSeenStr", lastSeenStr,
-					"error", err)
-			}
-		}
-
-		summaries = append(summaries, summary)
+		return nil, err
 	}
 
 	totalDuration := time.Since(queryStart)
 	if isDebugLoggingEnabled() {
 		getLogger().Debug("GetSpeciesSummaryData: Completed",
 			"total_duration_ms", totalDuration.Milliseconds(),
-			"rows_processed", rowCount)
+			"rows_processed", len(summaries))
 	}
 
 	return summaries, nil
 }
 
 // GetHourlyAnalyticsData retrieves detection counts grouped by hour
-func (ds *DataStore) GetHourlyAnalyticsData(date, species string) ([]HourlyAnalyticsData, error) {
+func (ds *DataStore) GetHourlyAnalyticsData(ctx context.Context, date, species string) ([]HourlyAnalyticsData, error) {
 	var analytics []HourlyAnalyticsData
 	hourFormat := ds.GetHourFormat()
 
 	// Base query
-	query := ds.DB.Table("notes").
+	query := ds.DB.WithContext(ctx).Table("notes").
 		Select(fmt.Sprintf("%s as hour, COUNT(*) as count", hourFormat)).
 		Group(hourFormat).
 		Order("hour")
@@ -245,11 +291,11 @@ func (ds *DataStore) GetHourlyAnalyticsData(date, species string) ([]HourlyAnaly
 }
 
 // GetDailyAnalyticsData retrieves detection counts grouped by day
-func (ds *DataStore) GetDailyAnalyticsData(startDate, endDate, species string) ([]DailyAnalyticsData, error) {
+func (ds *DataStore) GetDailyAnalyticsData(ctx context.Context, startDate, endDate, species string) ([]DailyAnalyticsData, error) {
 	var analytics []DailyAnalyticsData
 
 	// Base query
-	query := ds.DB.Table("notes").
+	query := ds.DB.WithContext(ctx).Table("notes").
 		Select("date, COUNT(*) as count").
 		Group("date").
 		Order("date")
@@ -285,7 +331,7 @@ func (ds *DataStore) GetDailyAnalyticsData(startDate, endDate, species string) (
 }
 
 // GetDetectionTrends calculates the trend in detections over time
-func (ds *DataStore) GetDetectionTrends(period string, limit int) ([]DailyAnalyticsData, error) {
+func (ds *DataStore) GetDetectionTrends(ctx context.Context, period string, limit int) ([]DailyAnalyticsData, error) {
 	var trends []DailyAnalyticsData
 
 	var interval string
@@ -314,7 +360,7 @@ func (ds *DataStore) GetDetectionTrends(period string, limit int) ([]DailyAnalyt
 			LIMIT ?
 		`, startDate)
 
-		if err := ds.DB.Raw(query, limit).Scan(&trends).Error; err != nil {
+		if err := ds.DB.WithContext(ctx).Raw(query, limit).Scan(&trends).Error; err != nil {
 			return nil, errors.New(err).
 				Component("datastore").
 				Category(errors.CategoryDatabase).
@@ -334,7 +380,7 @@ func (ds *DataStore) GetDetectionTrends(period string, limit int) ([]DailyAnalyt
 			LIMIT ?
 		`, startDate)
 
-		if err := ds.DB.Raw(query, limit).Scan(&trends).Error; err != nil {
+		if err := ds.DB.WithContext(ctx).Raw(query, limit).Scan(&trends).Error; err != nil {
 			return nil, errors.New(err).
 				Component("datastore").
 				Category(errors.CategoryDatabase).
@@ -362,7 +408,7 @@ func (ds *DataStore) GetDetectionTrends(period string, limit int) ([]DailyAnalyt
 
 // GetHourlyDistribution retrieves hourly detection distribution across a date range
 // Groups detections by hour of day (0-23) regardless of the specific date
-func (ds *DataStore) GetHourlyDistribution(startDate, endDate, species string) ([]HourlyDistributionData, error) {
+func (ds *DataStore) GetHourlyDistribution(ctx context.Context, startDate, endDate, species string) ([]HourlyDistributionData, error) {
 	var parsedStartDate, parsedEndDate time.Time
 	var err error
 
@@ -406,7 +452,7 @@ func (ds *DataStore) GetHourlyDistribution(startDate, endDate, species string) (
 	}
 
 	// Prepare the SQL query
-	query := ds.DB.Table("notes")
+	query := ds.DB.WithContext(ctx).Table("notes")
 
 	// Extract hour from the time field using database-specific hour format
 	hourExpr := ds.GetHourFormat()
@@ -456,7 +502,7 @@ func (ds *DataStore) GetHourlyDistribution(startDate, endDate, species string) (
 // This is suitable for seasonal and yearly tracking where we need to know when each species
 // was first detected within that specific period, regardless of prior detections.
 // It returns all species detected in the period with their first detection date in that period.
-func (ds *DataStore) GetSpeciesFirstDetectionInPeriod(startDate, endDate string, limit, offset int) ([]NewSpeciesData, error) {
+func (ds *DataStore) GetSpeciesFirstDetectionInPeriod(ctx context.Context, startDate, endDate string, limit, offset int) ([]NewSpeciesData, error) {
 	// Validate input
 	if startDate != "" && endDate != "" && startDate > endDate {
 		return nil, errors.Newf("start date cannot be after end date").
@@ -497,7 +543,7 @@ func (ds *DataStore) GetSpeciesFirstDetectionInPeriod(startDate, endDate string,
 	LIMIT ? OFFSET ?
 	`
 
-	if err := ds.DB.Raw(query, startDate, endDate, limit, offset).Scan(&results).Error; err != nil {
+	if err := ds.DB.WithContext(ctx).Raw(query, startDate, endDate, limit, offset).Scan(&results).Error; err != nil {
 		return nil, errors.New(err).
 			Component("datastore").
 			Category(errors.CategoryDatabase).
@@ -525,7 +571,7 @@ func (ds *DataStore) GetSpeciesFirstDetectionInPeriod(startDate, endDate string,
 // This is suitable for lifetime tracking only - NOT for seasonal or yearly tracking.
 // It supports pagination with limit and offset parameters.
 // NOTE: For optimal performance with large datasets, add a composite index on (scientific_name, date)
-func (ds *DataStore) GetNewSpeciesDetections(startDate, endDate string, limit, offset int) ([]NewSpeciesData, error) {
+func (ds *DataStore) GetNewSpeciesDetections(ctx context.Context, startDate, endDate string, limit, offset int) ([]NewSpeciesData, error) {
 	// Temporary struct to scan raw results, ensuring date can be checked for null/empty
 	type RawNewSpeciesResult struct {
 		ScientificName     string
@@ -586,7 +632,7 @@ func (ds *DataStore) GetNewSpeciesDetections(startDate, endDate string, limit, o
 	`
 
 	// Execute the raw SQL query into the temporary struct
-	if err := ds.DB.Raw(query, startDate, endDate, startDate, endDate, limit, offset).Scan(&rawResults).Error; err != nil {
+	if err := ds.DB.WithContext(ctx).Raw(query, startDate, endDate, startDate, endDate, limit, offset).Scan(&rawResults).Error; err != nil {
 		return nil, errors.New(err).
 			Component("datastore").
 			Category(errors.CategoryDatabase).

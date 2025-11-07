@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/url"
 	"reflect"
 	"sort"
 	"strconv"
 	"strings"
+	"text/template"
 	"time"
 	"unicode/utf8"
 
@@ -642,9 +644,7 @@ func deepMergeMaps(dst, src map[string]any) map[string]any {
 	result := make(map[string]any)
 
 	// Copy all values from dst
-	for k, v := range dst {
-		result[k] = v
-	}
+	maps.Copy(result, dst)
 
 	// Merge values from src
 	for k, v := range src {
@@ -710,6 +710,8 @@ func getSettingsSectionValue(settings *conf.Settings, section string) (any, erro
 		return &settings.Realtime.Telemetry, nil
 	case "sentry":
 		return &settings.Sentry, nil
+	case "notification":
+		return &settings.Notification, nil
 	default:
 		return nil, fmt.Errorf("unknown settings section: %s", section)
 	}
@@ -758,14 +760,15 @@ type sectionValidator func(data json.RawMessage) error
 // getSectionValidators returns validators for sections that need special validation
 func getSectionValidators() map[string]sectionValidator {
 	return map[string]sectionValidator{
-		"mqtt":      validateMQTTSection,
-		"rtsp":      validateRTSPSection,
-		"security":  validateSecuritySection,
-		"main":      validateMainSection,
-		"birdnet":   validateBirdNETSection,
-		"webserver": validateWebServerSection,
-		"species":   validateSpeciesSection,
-		"realtime":  validateRealtimeSection,
+		"mqtt":         validateMQTTSection,
+		"rtsp":         validateRTSPSection,
+		"security":     validateSecuritySection,
+		"main":         validateMainSection,
+		"birdnet":      validateBirdNETSection,
+		"webserver":    validateWebServerSection,
+		"species":      validateSpeciesSection,
+		"realtime":     validateRealtimeSection,
+		"notification": validateNotificationSection,
 	}
 }
 
@@ -810,8 +813,12 @@ var securitySectionAllowedFields = map[string]bool{
 
 // validateSecuritySection validates security settings
 func validateSecuritySection(data json.RawMessage) error {
-	// Security settings cannot be updated via API for security reasons
-	return fmt.Errorf("security settings cannot be updated via API")
+	var updateMap map[string]any
+	if err := json.Unmarshal(data, &updateMap); err != nil {
+		return err
+	}
+
+	return validateSecuritySectionValues(updateMap)
 }
 
 // validateSecuritySectionValues validates the values of security section fields
@@ -993,8 +1000,12 @@ var mainSectionAllowedFields = map[string]bool{
 
 // validateMainSection validates main settings
 func validateMainSection(data json.RawMessage) error {
-	// Main settings cannot be updated via API for security reasons
-	return fmt.Errorf("main settings cannot be updated via API")
+	var updateMap map[string]any
+	if err := json.Unmarshal(data, &updateMap); err != nil {
+		return err
+	}
+
+	return validateMainSectionValues(updateMap)
 }
 
 // validateMainSectionValues validates the values of main section fields
@@ -1093,13 +1104,13 @@ func validateSpeciesSection(data json.RawMessage) error {
 		if config.Interval < 0 {
 			return fmt.Errorf("species config for '%s': interval must be non-negative, got %d", speciesName, config.Interval)
 		}
-		
+
 		// Check if threshold is within valid range
 		if config.Threshold < 0 || config.Threshold > 1 {
 			return fmt.Errorf("species config for '%s': threshold must be between 0 and 1, got %f", speciesName, config.Threshold)
 		}
 	}
-	
+
 	return nil
 }
 
@@ -1116,13 +1127,36 @@ func validateRealtimeSection(data json.RawMessage) error {
 		if config.Interval < 0 {
 			return fmt.Errorf("species config for '%s': interval must be non-negative, got %d", speciesName, config.Interval)
 		}
-		
+
 		// Check if threshold is within valid range
 		if config.Threshold < 0 || config.Threshold > 1 {
 			return fmt.Errorf("species config for '%s': threshold must be between 0 and 1, got %f", speciesName, config.Threshold)
 		}
 	}
-	
+
+	return nil
+}
+
+// validateNotificationSection validates notification settings including template syntax
+func validateNotificationSection(data json.RawMessage) error {
+	var notificationConfig conf.NotificationConfig
+	if err := json.Unmarshal(data, &notificationConfig); err != nil {
+		return err
+	}
+
+	// Validate new species notification templates if present
+	if notificationConfig.Templates.NewSpecies.Title != "" {
+		if _, err := template.New("title").Parse(notificationConfig.Templates.NewSpecies.Title); err != nil {
+			return fmt.Errorf("invalid template syntax in new species title: %w", err)
+		}
+	}
+
+	if notificationConfig.Templates.NewSpecies.Message != "" {
+		if _, err := template.New("message").Parse(notificationConfig.Templates.NewSpecies.Message); err != nil {
+			return fmt.Errorf("invalid template syntax in new species message: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -1543,9 +1577,7 @@ func (c *Controller) GetLocales(ctx echo.Context) error {
 	// Return locales in the same format as v1 for compatibility
 	// This matches the client-side expectation of key-value pairs
 	locales := make(map[string]string)
-	for code, name := range conf.LocaleCodes {
-		locales[code] = name
-	}
+	maps.Copy(locales, conf.LocaleCodes)
 
 	c.logAPIRequest(ctx, slog.LevelInfo, "Retrieved locales successfully", "count", len(locales))
 

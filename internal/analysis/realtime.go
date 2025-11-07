@@ -172,6 +172,13 @@ func RealtimeAnalysis(settings *conf.Settings, notificationChan chan handlers.No
 	dataStore.SetMetrics(metrics.Datastore)
 	dataStore.SetSunCalcMetrics(metrics.SunCalc)
 
+	// Validate disk space before attempting to open the database
+	// This prevents startup failures due to insufficient disk space
+	// ValidateStartupDiskSpace already returns a fully structured error, so we return it directly
+	if err := datastore.ValidateStartupDiskSpace(settings.Output.SQLite.Path); err != nil {
+		return err
+	}
+
 	// Open a connection to the database and handle possible errors.
 	if err := dataStore.Open(); err != nil {
 		return err // Return error to stop execution if database connection fails.
@@ -611,11 +618,9 @@ func startAudioCapture(wg *sync.WaitGroup, settings *conf.Settings, quitChan, re
 
 // startClipCleanupMonitor initializes and starts the clip cleanup monitoring routine in a new goroutine.
 func startClipCleanupMonitor(wg *sync.WaitGroup, quitChan chan struct{}, dataStore datastore.Interface) {
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		clipCleanupMonitor(quitChan, dataStore)
-	}()
+	})
 }
 
 // startWeatherPolling initializes and starts the weather polling routine in a new goroutine.
@@ -631,11 +636,9 @@ func startWeatherPolling(wg *sync.WaitGroup, settings *conf.Settings, dataStore 
 		return
 	}
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		weatherService.StartPolling(quitChan)
-	}()
+	})
 }
 
 func startTelemetryEndpoint(wg *sync.WaitGroup, settings *conf.Settings, metrics *observability.Metrics, quitChan chan struct{}) {
@@ -724,22 +727,30 @@ func closeDataStore(store datastore.Interface) {
 // ClipCleanupMonitor monitors the database and deletes clips that meet the retention policy.
 // It also performs periodic cleanup of log deduplicator states to prevent memory growth.
 func clipCleanupMonitor(quitChan chan struct{}, dataStore datastore.Interface) {
-	// Create a ticker that triggers every five minutes to perform cleanup
-	ticker := time.NewTicker(5 * time.Minute)
+	// Get configurable cleanup check interval, with fallback to default
+	retention := conf.Setting().Realtime.Audio.Export.Retention
+	checkInterval := retention.CheckInterval
+	if checkInterval <= 0 {
+		checkInterval = conf.DefaultCleanupCheckInterval
+	}
+
+	// Create a ticker that triggers at the configured interval to perform cleanup
+	ticker := time.NewTicker(time.Duration(checkInterval) * time.Minute)
 	defer ticker.Stop() // Ensure the ticker is stopped to prevent leaks
 
 	// Get the shared disk manager logger
 	diskManagerLogger := diskmanager.GetLogger()
 
-	policy := conf.Setting().Realtime.Audio.Export.Retention.Policy
+	policy := retention.Policy
 	// Add structured logging
 	GetLogger().Info("Clip cleanup monitor initialized",
 		"policy", policy,
+		"check_interval_minutes", checkInterval,
 		"operation", "clip_cleanup_init")
-	log.Println("Clip retention policy:", policy)
+	log.Printf("Clip retention policy: %s, check interval: %d minutes", policy, checkInterval)
 	diskManagerLogger.Info("Cleanup timer started",
 		"policy", policy,
-		"interval_minutes", 5,
+		"interval_minutes", checkInterval,
 		"timestamp", time.Now().Format(time.RFC3339))
 
 	for {
@@ -795,6 +806,24 @@ func clipCleanupMonitor(quitChan chan struct{}, dataStore datastore.Interface) {
 
 			// priority based cleanup method
 			if conf.Setting().Realtime.Audio.Export.Retention.Policy == "usage" {
+				retention := conf.Setting().Realtime.Audio.Export.Retention
+				baseDir := conf.Setting().Realtime.Audio.Export.Path
+
+				// Check if we can skip cleanup
+				skip, utilization, err := diskmanager.ShouldSkipUsageBasedCleanup(&retention, baseDir, retention.Debug)
+
+				if err != nil {
+					diskManagerLogger.Warn("Failed to check disk usage for early exit via timer",
+						"error", err,
+						"continuing_with_cleanup", true)
+				} else if skip {
+					diskManagerLogger.Info("Disk usage below threshold via timer, skipping cleanup",
+						"current_usage", utilization,
+						"timestamp", time.Now().Format(time.RFC3339))
+					continue // Skip to next timer tick
+				}
+
+				// Proceed with cleanup
 				diskManagerLogger.Debug("Starting usage-based cleanup via timer")
 				result := diskmanager.UsageBasedCleanup(quitChan, dataStore)
 				if result.Err != nil {

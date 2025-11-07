@@ -11,7 +11,10 @@
     "search": "Buscar",
     "filter": "Filtrar",
     "sort": "Ordenar",
-    "actions": "Acciones",
+    "actions": {
+      "download": "Descargar",
+      "review": "Revisar"
+    },
     "settings": "Configuración",
     "close": "Cerrar",
     "back": "Atrás",
@@ -43,8 +46,10 @@
       "yes": "Sí",
       "no": "No",
       "ok": "OK",
+      "clear": "Limpiar",
       "edit-config": "Editar configuración",
-      "add-action": "Añadir acción"
+      "add-action": "Añadir acción",
+      "learnMore": "Más información"
     },
     "ui": {
       "loading": "Cargando...",
@@ -99,8 +104,23 @@
       "editSpecies": "Editar especie",
       "removeSpecies": "Eliminar especie",
       "dismissError": "Descartar error",
+      "datePickerCalendar": "Calendario selector de fecha",
+      "selectDate": "Seleccionar fecha",
+      "previousMonth": "Mes anterior",
+      "nextMonth": "Mes siguiente",
+      "selectToday": "Seleccionar hoy",
+      "dateSelected": "Fecha seleccionada: {date}",
+      "calendarNavigation": "Usa las flechas para navegar el calendario, Enter para seleccionar, Escape para cerrar",
       "downloadCsv": "Descargar lista de especies en CSV",
-      "calendarNavigation": "Navegación del calendario: usa las flechas para moverte, Enter para seleccionar, Esc para cerrar"
+      "visitEbirdLink": "Abrir eBird.org en una nueva pestaña",
+      "learnEbirdTaxonomyLink": "Abrir Taxonomía de eBird en una nueva pestaña"
+    },
+    "labels": {
+      "confidence": "Confianza"
+    },
+    "values": {
+      "yes": "Sí",
+      "no": "No"
     },
     "modal": {
       "confirmAction": "Confirmar acción",
@@ -115,11 +135,34 @@
       },
       "form": {
         "correctDetection": "Detección correcta",
-        "falsePositiveLabel": "Falso positivo"
+        "falsePositiveLabel": "Falso positivo",
+        "reviewDetectionTitle": "Revisar detección",
+        "lockDetection": "Bloquear esta detección después de guardar",
+        "lockDetectionHelp": "Bloquear esta detección evitará que se elimine durante la limpieza regular.",
+        "unlockDetection": "Desbloquear esta detección después de guardar",
+        "unlockDetectionHelp": "Desbloquear permitirá que esta detección se elimine durante la limpieza regular.",
+        "ignoreSpecies": "Ignorar esta especie",
+        "ignoreSpeciesHelp": "Ignorar esta especie evitará futuras detecciones de esta especie. Esto no eliminará las detecciones existentes.",
+        "detectionLocked": "Esta detección está actualmente bloqueada.",
+        "comment": "Comentario",
+        "addComment": "Añadir comentario",
+        "hideComment": "Ocultar comentario",
+        "commentPlaceholder": "Añade un comentario sobre esta detección...",
+        "commentCount": "({chars} caracteres)",
+        "chars": "caracteres",
+        "commentsLabel": "Comentarios",
+        "currentStatusTitle": "Estado actual",
+        "detectionStatusTitle": "Estado de detección",
+        "lockLabel": "Estado de bloqueo",
+        "reviewLabel": "Estado de revisión",
+        "saveReview": "Guardar revisión"
       },
       "errors": {
         "saveFailed": "Error al guardar la revisión. Por favor, inténtalo de nuevo.",
-        "noAudio": "No hay grabación de audio disponible para esta detección."
+        "noAudio": "No hay grabación de audio disponible para esta detección.",
+        "commentFailed": "Error al guardar el comentario. Por favor, inténtalo de nuevo.",
+        "lockStatusFailed": "Error al actualizar el estado de bloqueo. Por favor, inténtalo de nuevo.",
+        "verificationFailed": "Error al actualizar el estado de verificación. Por favor, inténtalo de nuevo."
       }
     }
   },
@@ -176,7 +219,17 @@
     "licenseText": "Tanto el modelo de IA BirdNET como BirdNET-Go están licenciados bajo la",
     "ccLicense": "Licencia Creative Commons Atribución-NoComercial-CompartirIgual 4.0 Internacional",
     "licenseDescription": "Esta licencia permite a otros remezclar, adaptar y construir sobre este trabajo de forma no comercial, siempre que se otorgue el crédito apropiado y las nuevas creaciones se licencien bajo términos idénticos.",
-    "dependencyLicenses": "Licencias de dependencias"
+    "dependencyLicenses": "Licencias de dependencias",
+    "taxonomyDataTitle": "Datos de taxonomía",
+    "taxonomyDataIntro": "BirdNET-Go incluye datos de taxonomía de aves incorporados derivados de la lista eBird/Clements, proporcionando búsquedas locales rápidas por género y familia.",
+    "source": "Fuente",
+    "ebirdApiV2": "eBird API v2",
+    "copyright": "Derechos de autor",
+    "coverage": "Cobertura",
+    "taxonomyCoverage": "2374 géneros, 254 familias, 11 145 especies",
+    "visitEbird": "Visitar eBird.org",
+    "ebirdOrg": "eBird.org",
+    "learnEbirdTaxonomy": "Más información sobre la taxonomía de eBird"
   },
   "notifications": {
     "title": "Notificaciones",
@@ -253,6 +306,8 @@
       "timeOfDay": "Hora del día"
     },
     "advancedFilters": "Filtros avanzados",
+    "showAdvancedFilters": "Mostrar filtros avanzados",
+    "hideAdvancedFilters": "Ocultar filtros avanzados",
     "verifiedOptions": {
       "any": "Cualquier estado",
       "verified": "Solo verificados",
@@ -350,6 +405,12 @@
         "biHourlyDetections": "{count} detecciones de {startHour}:00 a {endHour}:00 - Clic para ver",
         "sixHourlyDetections": "{count} detecciones de {startHour}:00 a {endHour}:00 - Clic para ver"
       },
+      "loading": {
+        "preparing": "Preparando datos...",
+        "fetching": "Obteniendo detecciones...",
+        "error": "Error al cargar los datos",
+        "complete": "Datos cargados exitosamente"
+      },
       "noSpecies": "No se detectaron especies en esta fecha"
     },
     "recentDetections": {
@@ -361,6 +422,8 @@
       "headers": {
         "dateTime": "Fecha y hora",
         "commonName": "Nombre común",
+        "species": "Especie",
+        "confidence": "Confianza",
         "thumbnail": "Miniatura",
         "status": "Estado",
         "recording": "Grabación",
@@ -407,10 +470,17 @@
       "dateTime": "Fecha y hora",
       "weather": "Clima",
       "species": "Especie",
+      "confidence": "Confianza",
       "thumbnail": "Miniatura",
       "status": "Estado",
       "recording": "Grabación",
       "actions": "Acciones"
+    },
+    "status": {
+      "locked": "Bloqueado"
+    },
+    "table": {
+      "caption": "Lista de detecciones de aves con fecha, especie, confianza e información de estado"
     },
     "empty": {
       "title": "No se encontraron detecciones",
@@ -420,17 +490,77 @@
       "showing": "Mostrando {from} a {to} de {total} resultados"
     },
     "weather": {
-      "noData": "Sin datos meteorológicos"
+      "noData": "Sin datos meteorológicos",
+      "units": {
+        "temperature": "°C",
+        "windSpeed": "m/s",
+        "humidity": "%"
+      },
+      "conditions": {
+        "clearsky_day": "Cielo despejado",
+        "clearsky_night": "Cielo despejado",
+        "fair_day": "Despejado",
+        "fair_night": "Despejado",
+        "partlycloudy_day": "Parcialmente nublado",
+        "partlycloudy_night": "Parcialmente nublado",
+        "cloudy": "Nublado",
+        "rainshowers_day": "Chubascos",
+        "rainshowers_night": "Chubascos",
+        "rain": "Lluvia",
+        "thunder": "Tormenta",
+        "sleet": "Aguanieve",
+        "snow": "Nieve",
+        "fog": "Niebla",
+        "unknown": "Desconocido"
+      }
     },
     "row": {
       "viewDetails": "Ver detalles para {species}"
+    },
+    "media": {
+      "title": "Grabación y espectrograma"
+    },
+    "tabs": {
+      "overview": "Resumen",
+      "taxonomy": "Taxonomía",
+      "history": "Historial",
+      "notes": "Notas"
+    },
+    "environmental": {
+      "title": "Condiciones ambientales"
+    },
+    "metadata": {
+      "title": "Metadatos de detección",
+      "source": "Fuente",
+      "duration": "Duración",
+      "status": "Estado",
+      "locked": "Bloqueado"
+    },
+    "history": {
+      "title": "Historial de detección",
+      "comingSoon": "El seguimiento del historial estará disponible próximamente..."
+    },
+    "notes": {
+      "title": "Notas y comentarios",
+      "noComments": "No hay comentarios ni notas para esta detección."
+    }
+  },
+  "species": {
+    "rarity": {
+      "title": "Rareza de la especie"
+    },
+    "taxonomy": {
+      "hierarchy": "Clasificación taxonómica",
+      "subspecies": "Subespecies",
+      "noData": "No hay datos de taxonomía disponibles."
     }
   },
   "system": {
     "title": "Panel del sistema",
     "refreshData": "Actualizar datos",
     "aria": {
-      "refreshData": "Actualizar datos del sistema"
+      "refreshData": "Actualizar datos del sistema",
+      "dashboard": "Panel del sistema con métricas de rendimiento e información"
     },
     "systemInfo": {
       "title": "Información del sistema",
@@ -587,6 +717,7 @@
       "audio": "Configuración de audio",
       "filters": "Filtros de detección",
       "integration": "Integraciones",
+      "notifications": "Notificaciones",
       "security": "Seguridad",
       "species": "Especies",
       "support": "Soporte"
@@ -797,6 +928,28 @@
                   "none": "Usar solo el proveedor seleccionado"
                 }
               }
+            },
+            "spectrogram": {
+              "title": "Generación de Espectrograma",
+              "mode": {
+                "label": "Modo de Generación",
+                "auto": {
+                  "label": "Automático (Recomendado)",
+                  "helpText": "Los espectrogramas se generan automáticamente cuando se visualiza una detección en la interfaz de usuario. Para listas largas de detecciones, la generación de espectrogramas puede tardar mucho tiempo en sistemas con recursos limitados de CPU."
+                },
+                "prerender": {
+                  "label": "Pre-renderizar en Segundo Plano",
+                  "helpText": "Genera espectrogramas automáticamente durante el guardado del clip de audio. En sistemas con recursos limitados como Raspberry Pi Zero o 3, esto proporciona una interfaz de usuario más receptiva debido a que los espectrogramas se renderizan en segundo plano. Sin embargo, este modo consumirá más espacio en disco ya que se crean espectrogramas para cada detección."
+                },
+                "userRequested": {
+                  "label": "Solo a Petición del Usuario",
+                  "helpText": "Generar espectrogramas solo cuando haga clic en el botón generar. Perfecto para sistemas con recursos limitados (Raspberry Pi 3/Zero) - cero sobrecarga automática, usted controla cuándo se usa la CPU."
+                }
+              },
+              "enabled": {
+                "label": "Habilitar Pre-renderizado de Espectrograma",
+                "helpText": "OBSOLETO: Use el Modo de Generación en su lugar. Generar espectrogramas en segundo plano cuando se guardan detecciones para eliminar retrasos de UI."
+              }
             }
           }
         }
@@ -922,6 +1075,76 @@
         }
       }
     },
+    "notifications": {
+      "sections": {
+        "testing": {
+          "title": "Probar notificaciones",
+          "description": "Envía notificaciones de prueba para verificar que tu sistema de notificaciones funciona correctamente"
+        },
+        "info": {
+          "title": "Información del sistema",
+          "description": "Aprende a ver y gestionar tus notificaciones"
+        }
+      },
+      "templates": {
+        "title": "Plantillas de notificación",
+        "description": "Personaliza los mensajes de notificación para detecciones de nuevas especies usando variables de plantilla",
+        "newSpeciesTitle": "Plantilla de notificación de nueva especie",
+        "titleLabel": "Plantilla de título",
+        "titlePlaceholder": "ej., Nueva especie: {{.CommonName}}",
+        "messageLabel": "Plantilla de mensaje",
+        "messagePlaceholder": "ej., Primera detección de {{.CommonName}}  ({{.ScientificName}})  con {{.ConfidencePercent}}% de confianza",
+        "resetButton": "Restablecer",
+        "saveButton": "Guardar plantillas",
+        "saveButtonUnsaved": "Guardar plantillas *",
+        "testButton": "Probar",
+        "savingButton": "Guardando...",
+        "sendingButton": "Enviando...",
+        "resetConfirm": "¿Restablecer plantillas a valores predeterminados? Esto descartará tus cambios actuales y restaurará los valores de plantilla predeterminados.",
+        "unsavedChangesWarning": "Tienes cambios de plantilla sin guardar. La prueba usará las plantillas guardadas actualmente, no tus ediciones. ¿Continuar?",
+        "testWithUnsavedChanges": "Advertencia: Tienes cambios sin guardar. La prueba usará las plantillas guardadas.",
+        "testNormal": "Enviar una notificación de prueba",
+        "saveSuccess": "¡Plantillas guardadas exitosamente!",
+        "saveError": "Error: {message}",
+        "availableVariables": "Variables de plantilla disponibles",
+        "variablesDescription": "Usa estas variables en tus plantillas con la sintaxis",
+        "loading": "Cargando..."
+      },
+      "testNotification": {
+        "title": "Enviar notificación de prueba de nueva especie",
+        "description": "Genera una notificación de prueba para una detección de nueva especie para verificar que tu sistema de notificaciones funciona",
+        "whatHappens": "Qué sucede cuando haces clic en 'Enviar prueba':",
+        "sendButton": "Enviar prueba",
+        "sendingButton": "Enviando...",
+        "statusMessages": {
+          "sending": "Enviando notificación de prueba...",
+          "success": "¡Notificación de prueba enviada exitosamente! Revisa tu campana de notificaciones.",
+          "error": "Error al enviar notificación de prueba: {message}",
+          "serviceUnavailable": "El servicio de notificaciones no está disponible. Por favor verifica tu configuración de notificaciones."
+        }
+      },
+      "statusMessages": {
+        "sending": "Enviando notificación de prueba...",
+        "success": "¡Notificación de prueba enviada exitosamente!",
+        "error": "Error al enviar notificación de prueba: {message}",
+        "serviceUnavailable": "El servicio de notificaciones no está disponible. Por favor verifica tu configuración de notificaciones."
+      },
+      "systemInfo": {
+        "howToView": "Cómo ver las notificaciones:",
+        "technicalDetails": "Detalles técnicos sobre las notificaciones en BirdNET-Go:"
+      },
+      "privacy": {
+        "title": "Aviso de privacidad para webhooks externos",
+        "description": "Las notificaciones de detección pueden incluir datos sensibles cuando se envían a servicios externos:",
+        "gps": "Coordenadas GPS",
+        "gpsDetails": "Ubicación exacta (latitud/longitud) si está configurada",
+        "urls": "URLs de detección",
+        "urlsDetails": "Pueden exponer información de la red interna",
+        "species": "Datos de especies",
+        "speciesDetails": "Qué aves fueron detectadas y cuándo",
+        "recommendation": "Active webhooks externos solo si confía en el servicio receptor o usa servicios auto-alojados/locales."
+      }
+    },
     "filters": {
       "privacyFiltering": {
         "title": "Filtrado de privacidad",
@@ -944,7 +1167,10 @@
       },
       "speciesNamePlaceholder": "Nombre de la especie",
       "typeSpeciesName": "Escribe el nombre de la especie...",
-      "dogBarkSpeciesList": "Lista de especies de ladrido de perro"
+      "dogBarkSpeciesList": "Lista de especies de ladrido de perro",
+      "errors": {
+        "speciesLoadFailed": "Error al cargar la lista de especies. Por favor, inténtalo de nuevo."
+      }
     },
     "audio": {
       "audioCapture": {
@@ -952,15 +1178,19 @@
         "description": "Establecer fuente de captura de audio, tarjeta de sonido o flujo RTSP",
         "soundCardSource": "Fuente de tarjeta de sonido",
         "audioSourceLabel": "Fuente de audio (requiere reinicio de la aplicación)",
+        "audioSourceHelp": "Selecciona el dispositivo de entrada de audio para la detección de sonidos de aves. Los cambios requieren reiniciar la aplicación para aplicarse.",
         "noSoundCardCapture": "Sin captura de tarjeta de sonido",
         "rtspSource": "Fuente RTSP",
         "rtspTransportLabel": "Protocolo de transporte RTSP",
-        "rtspUrlsLabel": "URLs de flujo RTSP"
+        "rtspTransportHelp": "TCP es más confiable pero puede tener mayor latencia. UDP es más rápido pero puede experimentar pérdida de paquetes en redes deficientes.",
+        "rtspUrlsLabel": "URLs de flujo RTSP",
+        "rtspUrlsHelp": "Ingresa una o más URLs de flujo RTSP para fuentes de audio de red. Formato: rtsp://ip:puerto/flujo. Nota: Las credenciales de autenticación deben configurarse por separado en la configuración del servidor RTSP por seguridad."
       },
       "audioFilters": {
         "title": "Filtros de audio",
         "description": "Configurar filtros de procesamiento de audio",
         "enableEqualizer": "Habilitar ecualizador de audio",
+        "enableEqualizerHelp": "Aplica filtrado de frecuencia para mejorar la detección de cantos de aves reduciendo el ruido no deseado y frecuencias.",
         "filterType": "Tipo de filtro",
         "newFilterType": "Nuevo tipo de filtro",
         "selectFilterType": "Seleccionar tipo de filtro",
@@ -968,23 +1198,29 @@
         "remove": "Eliminar",
         "frequencyResponse": "Respuesta de frecuencia",
         "cutoffFrequency": "Frecuencia de corte",
+        "cutoffFrequencyHelp": "Frecuencia a la cual el filtro comienza a atenuar señales. Los cantos de aves típicamente van de 1-10 kHz.",
         "qFactor": "Factor Q",
+        "qFactorHelp": "El factor de calidad controla la nitidez del filtro. Valores más bajos (0.1-1) crean pendientes más suaves, valores más altos (1-10) crean cortes más pronunciados.",
         "gain": "Ganancia",
+        "gainHelp": "Nivel de amplificación o atenuación en decibelios (dB).",
         "attenuation": "Atenuación",
+        "attenuationHelp": "Tasa de caída del filtro. Valores más altos proporcionan una atenuación más pronunciada de las frecuencias filtradas.",
         "attenuationLevels": {
           "0db": "0dB",
           "12db": "12dB",
           "24db": "24dB",
           "36db": "36dB",
           "48db": "48dB"
-        }
+        },
+        "filterHelp": "Añade múltiples filtros para dar forma a la respuesta de frecuencia para una detección óptima de aves en tu entorno."
       },
       "soundLevelMonitoring": {
         "title": "Monitoreo del nivel de sonido",
         "description": "Monitorear e informar niveles de sonido ambiental",
         "enable": "Habilitar monitoreo del nivel de sonido",
+        "enableHelp": "Rastrea los niveles de ruido ambiental para comprender tu entorno de grabación y correlacionar con patrones de actividad de aves.",
         "intervalLabel": "Intervalo de medición (segundos)",
-        "intervalHelp": "Con qué frecuencia informar las mediciones del nivel de sonido",
+        "intervalHelp": "Con qué frecuencia medir e informar los niveles de sonido. Valores más bajos proporcionan datos más granulares pero usan más recursos. Mínimo 5 segundos, recomendado 60 segundos.",
         "dataOutputTitle": "Salida de datos del nivel de sonido",
         "dataOutputDescription": "Cuando está habilitado, las mediciones del nivel de sonido se publican vía:",
         "mqttTopic": "Tema MQTT:",
@@ -996,28 +1232,52 @@
         "description": "Configurar la captura y procesamiento de clips de audio para llamadas de aves identificadas"
       },
       "audioExport": {
-        "title": "Exportación de audio",
-        "description": "Configurar el guardado de clips de audio para llamadas de aves identificadas",
         "enable": "Habilitar captura de audio",
-        "enableHelp": "Guardar clips de audio de llamadas de aves detectadas para revisión, compartir o construir conjuntos de datos personalizados.",
-        "enableDebug": "Habilitar modo de depuración",
+        "enableHelp": "Guardar clips de audio de cantos de aves detectados para revisión, compartir o construir conjuntos de datos personalizados.",
+        "captureSettings": "Configuración de captura",
+        "lengthLabel": "Duración de captura",
+        "lengthHelp": "Duración del audio a capturar para cada detección (10-60 segundos). Clips más largos proporcionan más contexto pero usan más almacenamiento.",
+        "preCaptureLabel": "Buffer pre-detección",
+        "preCaptureHelp": "Segundos de audio a incluir antes de que se detectara el ave (0-{max} segundos). Asegura que el canto completo del ave se capture desde su inicio.",
+        "gainLabel": "Ganancia de audio",
+        "gainHelp": "Amplificación de audio para clips guardados en decibelios (0 a 20 dB). Hace que los clips de audio guardados sean más fuertes para una escucha más fácil. No afecta la detección. 0 dB significa sin amplificación.",
+        "normalization": "Normalización de audio",
+        "normalizationEnable": "Habilitar normalización de volumen",
+        "normalizationHelp": "Ajusta automáticamente los niveles de audio al estándar de transmisión EBU R128 para un volumen de reproducción consistente en todos los clips.",
+        "targetLUFSLabel": "Volumen objetivo (LUFS)",
+        "targetLUFSHelp": "Objetivo de volumen integrado en LUFS (Loudness Units relative to Full Scale). -23 LUFS es el estándar de transmisión EBU R128. Rango: -40 a -10 LUFS.",
+        "loudnessRangeLabel": "Rango de volumen (LU)",
+        "loudnessRangeHelp": "Variación máxima de volumen dentro del clip (0-20 LU). Valores más bajos crean volumen más consistente pero pueden reducir la dinámica.",
+        "truePeakLabel": "Límite de pico verdadero (dBTP)",
+        "truePeakHelp": "Nivel máximo de pico verdadero para evitar recorte digital (-10 a 0 dBTP). -2 dBTP proporciona margen seguro para la mayoría de sistemas de reproducción.",
+        "normalizationNote": "Estándar EBU R128",
+        "normalizationNoteDescription": "La normalización de audio sigue el estándar de transmisión EBU R128, asegurando niveles de reproducción consistentes en diferentes dispositivos y evitando recortes.",
+        "fileSettings": "Configuración de archivo",
         "pathLabel": "Ruta de exportación",
-        "typeLabel": "Tipo de exportación",
-        "bitrateLabel": "Tasa de bits"
+        "pathHelp": "Directorio donde se guardarán los clips de audio. Las rutas relativas son desde el directorio de la aplicación. Ejemplo: 'clips/' o '/var/audio/birds/'",
+        "typeLabel": "Formato de exportación",
+        "typeHelp": "Formato de audio para clips guardados. WAV y FLAC son sin pérdida (mejor calidad, archivos más grandes). MP3, AAC y Opus son con pérdida (archivos más pequeños, ligera pérdida de calidad).",
+        "bitrateLabel": "Tasa de bits",
+        "bitrateHelp": "Tasa de bits de compresión de audio para formatos con pérdida. Rango: {min}-{max} kbps. Valores más altos proporcionan mejor calidad pero archivos más grandes.",
+        "losslessNote": "Los formatos sin pérdida preservan la calidad de audio original sin artefactos de compresión."
       },
       "audioClipRetention": {
         "title": "Retención de clips de audio",
         "description": "Configurar la limpieza de clips de audio",
         "policyLabel": "Política de retención",
+        "policyHelp": "Elige cómo se eliminan automáticamente los clips de audio. Ninguna: conservar todos los clips. Edad: eliminar clips más antiguos que lo especificado. Uso: eliminar los clips más antiguos cuando el uso del disco exceda el límite.",
         "maxAgeLabel": "Edad máxima",
+        "maxAgeHelp": "Eliminar clips de audio más antiguos que esta duración. Formato: número seguido de unidad (h=horas, d=días, w=semanas, m=meses). Ejemplos: '7d' para 7 días, '4w' para 4 semanas.",
         "maxUsageLabel": "Uso máximo de disco",
-        "maxUsageHelp": "Eliminar los clips más antiguos cuando el directorio de audio use más de este porcentaje del espacio libre disponible.",
-        "minClipsLabel": "Clips mínimos",
+        "maxUsageHelp": "Eliminar los clips más antiguos cuando el directorio de audio use más de este porcentaje del espacio disponible en disco.",
+        "minClipsLabel": "Clips mínimos por especie",
+        "minClipsHelp": "Siempre mantener al menos esta cantidad de clips para cada especie de ave, independientemente de la edad o uso del disco. Ayuda a preservar grabaciones raras.",
         "keepSpectrograms": "Mantener imágenes de espectrograma",
+        "keepSpectrogramsHelp": "Retener imágenes de espectrograma incluso cuando se eliminen clips de audio. Los espectrogramas usan menos espacio y proporcionan referencia visual.",
         "policies": {
-          "none": "Ninguna",
-          "age": "Edad",
-          "usage": "Uso"
+          "none": "Ninguna - Mantener todo",
+          "age": "Basada en edad",
+          "usage": "Basada en uso de disco"
         }
       },
       "formats": {
@@ -1030,6 +1290,17 @@
       "transport": {
         "tcp": "TCP",
         "udp": "UDP"
+      },
+      "filterTypes": {
+        "lowpass": "Filtro paso bajo",
+        "highpass": "Filtro paso alto",
+        "bandpass": "Filtro paso banda",
+        "bandstop": "Filtro elimina banda"
+      },
+      "errors": {
+        "devicesLoadFailed": "Error al cargar dispositivos de audio. Por favor verifica los permisos del sistema.",
+        "invalidBitrate": "Valor de tasa de bits inválido",
+        "invalidRetentionPolicy": "Política de retención inválida"
       }
     },
     "integration": {
@@ -1256,7 +1527,10 @@
       "addSpeciesToExclude": "Añadir especies a excluir",
       "addSpeciesToExcludeLabel": "Añadir nuevas especies a excluir",
       "commandPathPlaceholder": "/ruta/a/tu/comando",
-      "parametersPlaceholder": "Los parámetros aparecerán aquí"
+      "parametersPlaceholder": "Los parámetros aparecerán aquí",
+      "errors": {
+        "speciesLoadFailed": "Error al cargar la lista de especies. Por favor, inténtalo de nuevo."
+      }
     },
     "security": {
       "hostLabel": "Dirección del host",
@@ -1332,7 +1606,25 @@
   "auth": {
     "login": "Iniciar sesión",
     "logout": "Cerrar sesión",
-    "openLoginModal": "Abrir ventana de inicio de sesión"
+    "openLoginModal": "Abrir ventana de inicio de sesión",
+    "loginTitle": "Iniciar sesión en BirdNET-Go",
+    "password": "Contraseña",
+    "passwordPlaceholder": "Ingresa tu contraseña",
+    "or": "o",
+    "loginWithGoogle": "Iniciar sesión con Google",
+    "loginWithGithub": "Iniciar sesión con GitHub",
+    "errors": {
+      "loginFailed": "Error al iniciar sesión. Por favor verifica tu contraseña e inténtalo de nuevo.",
+      "passwordRequired": "La contraseña es requerida.",
+      "passwordTooLong": "La contraseña es demasiado larga.",
+      "invalidCharacters": "La contraseña contiene caracteres inválidos.",
+      "invalidCredentials": "Nombre de usuario o contraseña inválidos.",
+      "tooManyAttempts": "Demasiados intentos de inicio de sesión. Por favor inténtalo más tarde.",
+      "serverError": "Ocurrió un error del servidor. Por favor inténtalo más tarde.",
+      "rateLimited": "Demasiados intentos. Por favor espera {minutes} minutos antes de intentar de nuevo.",
+      "configurationError": "Error de configuración de autenticación. Por favor contacta al soporte.",
+      "invalidInput": "Entrada inválida proporcionada."
+    }
   },
   "dataDisplay": {
     "table": {
@@ -1459,6 +1751,14 @@
       "filterControl": "Control de filtro",
       "highPassFilter": "Control de filtro paso alto: {freq} Hz",
       "seekProgress": "Progreso de búsqueda de audio: {current} / {total} segundos"
+    },
+    "spectrogram": {
+      "notGenerated": "Espectrograma aún no generado",
+      "generate": "Generar espectrograma",
+      "generateButton": "Generar",
+      "generating": "Generando...",
+      "generationFailed": "Error al generar el espectrograma",
+      "generationSuccess": "Espectrograma generado exitosamente"
     }
   },
   "components": {
@@ -1490,6 +1790,13 @@
         "loading": "Cargando calendario...",
         "error": "Error al cargar el calendario"
       }
+    }
+  },
+  "detection": {
+    "actions": {
+      "back": "Atrás",
+      "review": "Revisar",
+      "download": "Descargar"
     }
   }
 }

@@ -16,6 +16,7 @@ import (
 
 	"github.com/tphakala/birdnet-go/internal/conf"
 	"github.com/tphakala/birdnet-go/internal/datastore"
+	"github.com/tphakala/birdnet-go/internal/datastore/mocks"
 )
 
 // TestCleanupExpiredCache_CriticalReliability tests cache cleanup for memory management
@@ -96,11 +97,14 @@ func TestCleanupExpiredCache_CriticalReliability(t *testing.T) {
 			t.Logf("Testing cache cleanup scenario: %s", tt.description)
 
 			// Create tracker
-			ds := &MockSpeciesDatastore{}
-			ds.On("GetNewSpeciesDetections", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-				Return([]datastore.NewSpeciesData{}, nil)
-			ds.On("GetSpeciesFirstDetectionInPeriod", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-				Return([]datastore.NewSpeciesData{}, nil)
+			ds := mocks.NewMockInterface(t)
+			ds.On("GetNewSpeciesDetections", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+				Return([]datastore.NewSpeciesData{}, nil).Maybe()
+			// BG-17: InitFromDatabase now loads notification history
+			ds.On("GetActiveNotificationHistory", mock.AnythingOfType("time.Time")).
+				Return([]datastore.NotificationHistory{}, nil).Maybe()
+			ds.On("GetSpeciesFirstDetectionInPeriod", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+				Return([]datastore.NewSpeciesData{}, nil).Maybe()
 
 			settings := &conf.SpeciesTrackingSettings{
 				Enabled:              true,
@@ -217,11 +221,14 @@ func TestCacheLRUEviction_CriticalReliability(t *testing.T) {
 	t.Parallel()
 
 	// Create tracker
-	ds := &MockSpeciesDatastore{}
-	ds.On("GetNewSpeciesDetections", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-		Return([]datastore.NewSpeciesData{}, nil)
-	ds.On("GetSpeciesFirstDetectionInPeriod", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-		Return([]datastore.NewSpeciesData{}, nil)
+	ds := mocks.NewMockInterface(t)
+	ds.On("GetNewSpeciesDetections", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return([]datastore.NewSpeciesData{}, nil).Maybe()
+	// BG-17: InitFromDatabase now loads notification history
+	ds.On("GetActiveNotificationHistory", mock.AnythingOfType("time.Time")).
+		Return([]datastore.NotificationHistory{}, nil).Maybe()
+	ds.On("GetSpeciesFirstDetectionInPeriod", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return([]datastore.NewSpeciesData{}, nil).Maybe()
 
 	settings := &conf.SpeciesTrackingSettings{
 		Enabled:              true,
@@ -243,7 +250,7 @@ func TestCacheLRUEviction_CriticalReliability(t *testing.T) {
 	const targetSize = 800 // From implementation
 
 	// Add entries with different timestamps for LRU testing
-	for i := 0; i < totalEntries; i++ {
+	for i := range totalEntries {
 		speciesName := fmt.Sprintf("LRU_Test_Species_%04d", i)
 		// Older entries have earlier timestamps (but within TTL)
 		entryTime := currentTime.Add(-time.Duration(totalEntries-i) * time.Second)
@@ -274,7 +281,7 @@ func TestCacheLRUEviction_CriticalReliability(t *testing.T) {
 	keptCount := 0
 	removedCount := 0
 
-	for i := 0; i < totalEntries; i++ {
+	for i := range totalEntries {
 		speciesName := fmt.Sprintf("LRU_Test_Species_%04d", i)
 		if _, exists := tracker.statusCache[speciesName]; exists {
 			keptCount++
@@ -382,11 +389,14 @@ func TestBuildSpeciesStatusWithBuffer_CriticalReliability(t *testing.T) {
 			t.Logf("Testing status building: %s", tt.description)
 
 			// Create tracker
-			ds := &MockSpeciesDatastore{}
-			ds.On("GetNewSpeciesDetections", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-				Return([]datastore.NewSpeciesData{}, nil)
-			ds.On("GetSpeciesFirstDetectionInPeriod", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-				Return([]datastore.NewSpeciesData{}, nil)
+			ds := mocks.NewMockInterface(t)
+			ds.On("GetNewSpeciesDetections", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+				Return([]datastore.NewSpeciesData{}, nil).Maybe()
+			// BG-17: InitFromDatabase now loads notification history
+			ds.On("GetActiveNotificationHistory", mock.AnythingOfType("time.Time")).
+				Return([]datastore.NotificationHistory{}, nil).Maybe()
+			ds.On("GetSpeciesFirstDetectionInPeriod", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+				Return([]datastore.NewSpeciesData{}, nil).Maybe()
 
 			settings := &conf.SpeciesTrackingSettings{
 				Enabled:              true,
@@ -479,11 +489,14 @@ func TestConcurrentCacheOperations_CriticalReliability(t *testing.T) {
 	t.Parallel()
 
 	// Create tracker
-	ds := &MockSpeciesDatastore{}
-	ds.On("GetNewSpeciesDetections", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-		Return([]datastore.NewSpeciesData{}, nil)
-	ds.On("GetSpeciesFirstDetectionInPeriod", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-		Return([]datastore.NewSpeciesData{}, nil)
+	ds := mocks.NewMockInterface(t)
+	ds.On("GetNewSpeciesDetections", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return([]datastore.NewSpeciesData{}, nil).Maybe()
+	// BG-17: InitFromDatabase now loads notification history
+	ds.On("GetActiveNotificationHistory", mock.AnythingOfType("time.Time")).
+		Return([]datastore.NotificationHistory{}, nil).Maybe()
+	ds.On("GetSpeciesFirstDetectionInPeriod", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return([]datastore.NewSpeciesData{}, nil).Maybe()
 
 	settings := &conf.SpeciesTrackingSettings{
 		Enabled:              true,
@@ -503,12 +516,12 @@ func TestConcurrentCacheOperations_CriticalReliability(t *testing.T) {
 	errors := make(chan error, numGoroutines*opsPerGoroutine)
 
 	// Run concurrent operations that stress the cache
-	for i := 0; i < numGoroutines; i++ {
+	for i := range numGoroutines {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
 
-			for op := 0; op < opsPerGoroutine; op++ {
+			for op := range opsPerGoroutine {
 				// Mix of operations
 				switch op % 4 {
 				case 0: // Add to cache

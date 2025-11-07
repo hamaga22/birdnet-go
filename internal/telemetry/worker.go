@@ -1,6 +1,7 @@
 package telemetry
 
 import (
+	"maps"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -27,18 +28,18 @@ type TelemetryWorker struct {
 	circuitBreaker *CircuitBreaker
 	config         *WorkerConfig
 	configMu       sync.RWMutex // Protects config access
-	
+
 	// Metrics
 	eventsProcessed atomic.Uint64
 	eventsDropped   atomic.Uint64
 	eventsFailed    atomic.Uint64
-	
+
 	// Rate limiting
 	rateLimiter *RateLimiter
-	
-	// Sentry reporter
-	sentryReporter *errors.SentryReporter
-	
+
+	// Sentry reporter (using interface for testability)
+	sentryReporter errors.TelemetryReporter
+
 	logger *slog.Logger
 }
 
@@ -48,14 +49,14 @@ type WorkerConfig struct {
 	FailureThreshold  int
 	RecoveryTimeout   time.Duration
 	HalfOpenMaxEvents int
-	
+
 	// Rate limiting
 	RateLimitWindow    time.Duration
 	RateLimitMaxEvents int
-	
+
 	// Sampling
 	SamplingRate float64 // 0.0-1.0, where 1.0 = 100% sampling
-	
+
 	// Batching
 	BatchingEnabled bool
 	BatchSize       int
@@ -87,12 +88,23 @@ type CircuitBreaker struct {
 	config          *WorkerConfig
 }
 
+// TimeSource is an interface for getting the current time (allows testing with fake time)
+type TimeSource interface {
+	Now() time.Time
+}
+
+// RealTimeSource uses the actual system time
+type RealTimeSource struct{}
+
+func (RealTimeSource) Now() time.Time { return time.Now() }
+
 // RateLimiter implements rate limiting for telemetry
 type RateLimiter struct {
 	mu         sync.Mutex
 	window     time.Duration
 	maxEvents  int
 	eventTimes []time.Time
+	timeSource TimeSource // Injectable time source for testing
 }
 
 // NewTelemetryWorker creates a new telemetry worker
@@ -100,7 +112,7 @@ func NewTelemetryWorker(enabled bool, config *WorkerConfig) (*TelemetryWorker, e
 	if config == nil {
 		config = DefaultWorkerConfig()
 	}
-	
+
 	worker := &TelemetryWorker{
 		enabled: enabled,
 		config:  config,
@@ -109,13 +121,14 @@ func NewTelemetryWorker(enabled bool, config *WorkerConfig) (*TelemetryWorker, e
 			config: config,
 		},
 		rateLimiter: &RateLimiter{
-			window:    config.RateLimitWindow,
-			maxEvents: config.RateLimitMaxEvents,
+			window:     config.RateLimitWindow,
+			maxEvents:  config.RateLimitMaxEvents,
+			timeSource: RealTimeSource{}, // Use real time by default
 		},
 		sentryReporter: errors.NewSentryReporter(enabled),
 		logger:         getLoggerSafe("telemetry-worker"),
 	}
-	
+
 	return worker, nil
 }
 
@@ -130,7 +143,7 @@ func (w *TelemetryWorker) ProcessEvent(event events.ErrorEvent) error {
 	if !w.enabled {
 		return nil
 	}
-	
+
 	// Check circuit breaker
 	if !w.circuitBreaker.Allow() {
 		w.eventsDropped.Add(1)
@@ -140,7 +153,7 @@ func (w *TelemetryWorker) ProcessEvent(event events.ErrorEvent) error {
 		)
 		return nil
 	}
-	
+
 	// Check rate limit
 	if !w.rateLimiter.Allow() {
 		w.eventsDropped.Add(1)
@@ -150,18 +163,18 @@ func (w *TelemetryWorker) ProcessEvent(event events.ErrorEvent) error {
 		)
 		return nil
 	}
-	
+
 	// Apply sampling
 	if !w.shouldSample(event) {
 		w.eventsDropped.Add(1)
 		return nil
 	}
-	
+
 	// Check if already reported
 	if event.IsReported() {
 		return nil
 	}
-	
+
 	// Report to Sentry
 	err := w.reportToSentry(event)
 	if err != nil {
@@ -174,12 +187,12 @@ func (w *TelemetryWorker) ProcessEvent(event events.ErrorEvent) error {
 		)
 		return err
 	}
-	
+
 	// Success
 	w.eventsProcessed.Add(1)
 	w.circuitBreaker.RecordSuccess()
 	event.MarkReported()
-	
+
 	return nil
 }
 
@@ -188,12 +201,12 @@ func (w *TelemetryWorker) ProcessBatch(errorEvents []events.ErrorEvent) error {
 	if !w.enabled || len(errorEvents) == 0 {
 		return nil
 	}
-	
+
 	// Process each event individually for now
 	// Future enhancement: batch reporting to Sentry
 	var firstError error
 	successCount := 0
-	
+
 	for _, event := range errorEvents {
 		err := w.ProcessEvent(event)
 		if err != nil && firstError == nil {
@@ -202,13 +215,13 @@ func (w *TelemetryWorker) ProcessBatch(errorEvents []events.ErrorEvent) error {
 			successCount++
 		}
 	}
-	
+
 	w.logger.Debug("processed telemetry batch",
 		"total", len(errorEvents),
 		"success", successCount,
 		"failed", len(errorEvents)-successCount,
 	)
-	
+
 	return firstError
 }
 
@@ -229,18 +242,16 @@ func (w *TelemetryWorker) reportToSentry(event events.ErrorEvent) error {
 			Component(event.GetComponent()).
 			Category(errors.ErrorCategory(event.GetCategory())).
 			Build()
-		
+
 		// Add context if available
 		if ctx := event.GetContext(); ctx != nil {
-			for k, v := range ctx {
-				ee.Context[k] = v
-			}
+			maps.Copy(ee.Context, ctx)
 		}
 	}
-	
+
 	// Use cached SentryReporter
 	w.sentryReporter.ReportError(ee)
-	
+
 	return nil
 }
 
@@ -249,16 +260,16 @@ func (w *TelemetryWorker) shouldSample(event events.ErrorEvent) bool {
 	w.configMu.RLock()
 	samplingRate := w.config.SamplingRate
 	w.configMu.RUnlock()
-	
+
 	if samplingRate >= 1.0 {
 		return true
 	}
-	
+
 	// Simple sampling based on hash of component + category
 	// This ensures consistent sampling for similar errors
 	hash := hashString(event.GetComponent() + event.GetCategory())
 	sample := float64(hash%100) / 100.0
-	
+
 	return sample < samplingRate
 }
 
@@ -295,7 +306,7 @@ type WorkerStats struct {
 func (cb *CircuitBreaker) Allow() bool {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
-	
+
 	switch cb.state {
 	case "open":
 		// Check if we should transition to half-open
@@ -305,11 +316,11 @@ func (cb *CircuitBreaker) Allow() bool {
 			return true
 		}
 		return false
-		
+
 	case "half-open":
 		// Allow limited events in half-open state
 		return cb.successCount < cb.config.HalfOpenMaxEvents
-		
+
 	default: // closed
 		return true
 	}
@@ -319,9 +330,9 @@ func (cb *CircuitBreaker) Allow() bool {
 func (cb *CircuitBreaker) RecordSuccess() {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
-	
+
 	cb.failures = 0
-	
+
 	if cb.state == "half-open" {
 		cb.successCount++
 		if cb.successCount >= cb.config.HalfOpenMaxEvents {
@@ -334,14 +345,14 @@ func (cb *CircuitBreaker) RecordSuccess() {
 func (cb *CircuitBreaker) RecordFailure() {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
-	
+
 	cb.failures++
 	cb.lastFailureTime = time.Now()
-	
+
 	if cb.failures >= cb.config.FailureThreshold {
 		cb.state = "open"
 	}
-	
+
 	if cb.state == "half-open" {
 		cb.state = "open"
 	}
@@ -360,10 +371,10 @@ func (cb *CircuitBreaker) State() string {
 func (rl *RateLimiter) Allow() bool {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
-	
-	now := time.Now()
+
+	now := rl.timeSource.Now()
 	cutoff := now.Add(-rl.window)
-	
+
 	// Remove old events outside the window
 	validEvents := make([]time.Time, 0, len(rl.eventTimes))
 	for _, t := range rl.eventTimes {
@@ -372,12 +383,12 @@ func (rl *RateLimiter) Allow() bool {
 		}
 	}
 	rl.eventTimes = validEvents
-	
+
 	// Check if we can accept a new event
 	if len(rl.eventTimes) >= rl.maxEvents {
 		return false
 	}
-	
+
 	// Add the new event
 	rl.eventTimes = append(rl.eventTimes, now)
 	return true

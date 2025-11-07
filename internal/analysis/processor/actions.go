@@ -63,7 +63,7 @@ const (
 
 // Action is the base interface for all actions that can be executed
 type Action interface {
-	Execute(data interface{}) error
+	Execute(data any) error
 	GetDescription() string
 }
 
@@ -71,7 +71,7 @@ type Action interface {
 // This allows for proper cancellation and timeout propagation
 type ContextAction interface {
 	Action
-	ExecuteContext(ctx context.Context, data interface{}) error
+	ExecuteContext(ctx context.Context, data any) error
 }
 
 type LogAction struct {
@@ -91,6 +91,7 @@ type DatabaseAction struct {
 	EventTracker      *EventTracker
 	NewSpeciesTracker *species.SpeciesTracker // Add reference to new species tracker
 	processor         *Processor              // Add reference to processor for source name resolution
+	PreRenderer       PreRendererSubmit       // Spectrogram pre-renderer
 	Description       string
 	CorrelationID     string     // Detection correlation ID for log tracking
 	mu                sync.Mutex // Protect concurrent access to Note and Results
@@ -100,10 +101,40 @@ type SaveAudioAction struct {
 	Settings      *conf.Settings
 	ClipName      string
 	pcmData       []byte
+	NoteID        uint              // Note ID for correlation logging with pre-renderer
+	PreRenderer   PreRendererSubmit // Injected from processor
 	EventTracker  *EventTracker
 	Description   string
 	CorrelationID string     // Detection correlation ID for log tracking
 	mu            sync.Mutex // Protect concurrent access to pcmData
+}
+
+// PreRenderJob represents a spectrogram pre-rendering task.
+// This is a local DTO to avoid direct coupling to spectrogram package types.
+type PreRenderJob struct {
+	PCMData   []byte    // Raw PCM data from memory (s16le, 48kHz, mono)
+	ClipPath  string    // Full absolute path to audio clip file
+	NoteID    uint      // For logging correlation
+	Timestamp time.Time // Job submission time
+}
+
+// Methods to expose fields (allows prerenderer to access without importing processor)
+func (j PreRenderJob) GetPCMData() []byte      { return j.PCMData }
+func (j PreRenderJob) GetClipPath() string     { return j.ClipPath }
+func (j PreRenderJob) GetNoteID() uint         { return j.NoteID }
+func (j PreRenderJob) GetTimestamp() time.Time { return j.Timestamp }
+
+// PreRendererSubmit is an interface for submitting pre-render jobs.
+// Callers create PreRenderJob instances, and the implementation adapts them
+// to spectrogram-specific types at the boundary.
+type PreRendererSubmit interface {
+	Submit(job interface {
+		GetPCMData() []byte
+		GetClipPath() string
+		GetNoteID() uint
+		GetTimestamp() time.Time
+	}) error
+	Stop() // Graceful shutdown
 }
 
 type BirdWeatherAction struct {
@@ -254,7 +285,7 @@ func (a *CompositeAction) GetDescription() string {
 
 // Execute runs all actions sequentially, stopping on first error
 // This method is designed to prevent deadlocks and handle timeouts properly
-func (a *CompositeAction) Execute(data interface{}) error {
+func (a *CompositeAction) Execute(data any) error {
 	// Handle nil or empty actions gracefully
 	if a == nil || a.Actions == nil || len(a.Actions) == 0 {
 		return nil // Nothing to execute
@@ -297,7 +328,7 @@ func (a *CompositeAction) Execute(data interface{}) error {
 }
 
 // executeActionWithRecovery executes a single action with panic recovery and proper context handling
-func (a *CompositeAction) executeActionWithRecovery(action Action, data interface{}, step, total int) error {
+func (a *CompositeAction) executeActionWithRecovery(action Action, data any, step, total int) error {
 	// Determine the timeout to use
 	timeout := CompositeActionTimeout
 	if a.Timeout != nil {
@@ -476,7 +507,7 @@ func (a *CompositeAction) executeActionWithRecovery(action Action, data interfac
 }
 
 // Execute logs the note to the chag log file
-func (a *LogAction) Execute(data interface{}) error {
+func (a *LogAction) Execute(data any) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -515,7 +546,7 @@ func (a *LogAction) Execute(data interface{}) error {
 }
 
 // Execute saves the note to the database
-func (a *DatabaseAction) Execute(data interface{}) error {
+func (a *DatabaseAction) Execute(data any) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -586,9 +617,12 @@ func (a *DatabaseAction) Execute(data interface{}) error {
 
 		// Create a SaveAudioAction and execute it
 		saveAudioAction := &SaveAudioAction{
-			Settings: a.Settings,
-			ClipName: a.Note.ClipName,
-			pcmData:  pcmData,
+			Settings:      a.Settings,
+			ClipName:      a.Note.ClipName,
+			pcmData:       pcmData,
+			NoteID:        a.Note.ID,
+			PreRenderer:   a.PreRenderer,
+			CorrelationID: a.CorrelationID,
 		}
 
 		if err := saveAudioAction.Execute(nil); err != nil {
@@ -697,6 +731,32 @@ func (a *DatabaseAction) publishNewSpeciesDetectionEvent(isNewSpecies bool, days
 		return
 	}
 
+	// Add location, time, and note ID to metadata for template rendering
+	// Only add metadata if the map is non-nil to prevent panic
+	metadata := detectionEvent.GetMetadata()
+	if metadata != nil {
+		metadata["note_id"] = a.Note.ID
+		metadata["latitude"] = a.Note.Latitude
+		metadata["longitude"] = a.Note.Longitude
+		metadata["begin_time"] = a.Note.BeginTime
+
+		// Get bird image URL from cache and add to metadata
+		if a.processor != nil && a.processor.BirdImageCache != nil {
+			birdImage, err := a.processor.BirdImageCache.Get(a.Note.ScientificName)
+			if err == nil && birdImage.URL != "" {
+				metadata["image_url"] = birdImage.URL
+			}
+		}
+	} else {
+		// Log error if metadata is nil (shouldn't happen in normal operation)
+		GetLogger().Error("Detection event metadata is nil",
+			"component", "analysis.processor.actions",
+			"detection_id", a.CorrelationID,
+			"species", a.Note.CommonName,
+			"scientific_name", a.Note.ScientificName,
+			"operation", "publish_detection_event")
+	}
+
 	// Publish the detection event
 	if published := eventBus.TryPublishDetection(detectionEvent); published {
 		// Only record notification as sent if publishing succeeded
@@ -721,7 +781,7 @@ func (a *DatabaseAction) publishNewSpeciesDetectionEvent(isNewSpecies bool, days
 }
 
 // Execute saves the audio clip to a file
-func (a *SaveAudioAction) Execute(data interface{}) error {
+func (a *SaveAudioAction) Execute(data any) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -772,11 +832,58 @@ func (a *SaveAudioAction) Execute(data interface{}) error {
 		}
 	}
 
+	// Get file size for logging
+	fileInfo, err := os.Stat(outputPath)
+	var fileSize int64
+	if err == nil {
+		fileSize = fileInfo.Size()
+	} else {
+		// Debug log if we can't stat the file (shouldn't happen after successful write)
+		GetLogger().Debug("Failed to stat audio file for size logging",
+			"component", "analysis.processor.actions",
+			"detection_id", a.CorrelationID,
+			"error", err,
+			"path", outputPath,
+			"operation", "audio_export_stat")
+	}
+
+	// Log successful audio export at INFO level (BG-18)
+	// This provides evidence that audio export completed successfully
+	GetLogger().Info("Audio clip saved successfully",
+		"component", "analysis.processor.actions",
+		"detection_id", a.CorrelationID,
+		"clip_path", a.ClipName,
+		"file_size_bytes", fileSize,
+		"format", a.Settings.Realtime.Audio.Export.Type,
+		"operation", "audio_export_success")
+
+	// Submit for pre-rendering if enabled
+	if a.Settings.Realtime.Dashboard.Spectrogram.Enabled && a.PreRenderer != nil {
+		// Create pre-render job using local DTO (avoids direct spectrogram dependency)
+		job := PreRenderJob{
+			PCMData:   a.pcmData,
+			ClipPath:  outputPath, // Use full path to audio file
+			NoteID:    a.NoteID,
+			Timestamp: time.Now(),
+		}
+
+		// Non-blocking submission - errors logged but don't fail action
+		if err := a.PreRenderer.Submit(job); err != nil {
+			GetLogger().Warn("Failed to submit spectrogram pre-render job",
+				"component", "analysis.processor.actions",
+				"detection_id", a.CorrelationID,
+				"note_id", a.NoteID,
+				"clip_path", outputPath,
+				"error", err,
+				"operation", "prerender_submit")
+		}
+	}
+
 	return nil
 }
 
 // Execute sends the note to the BirdWeather API
-func (a *BirdWeatherAction) Execute(data interface{}) error {
+func (a *BirdWeatherAction) Execute(data any) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -891,7 +998,7 @@ type NoteWithBirdImage struct {
 }
 
 // Execute sends the note to the MQTT broker
-func (a *MqttAction) Execute(data interface{}) error {
+func (a *MqttAction) Execute(data any) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -1067,31 +1174,51 @@ func (a *MqttAction) Execute(data interface{}) error {
 }
 
 // Execute updates the range filter species list, this is run every day
-func (a *UpdateRangeFilterAction) Execute(data interface{}) error {
+// Note: The ShouldUpdateRangeFilterToday() check in processor.go ensures this action
+// is only created once per day, preventing duplicate concurrent updates (GitHub issue #1357)
+func (a *UpdateRangeFilterAction) Execute(data any) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
+	// Get current date for the range filter calculation
 	today := time.Now().Truncate(24 * time.Hour)
-	if today.After(a.Settings.BirdNET.RangeFilter.LastUpdated) {
-		// Update location based species list
-		speciesScores, err := a.Bn.GetProbableSpecies(today, 0.0)
-		if err != nil {
-			return err
-		}
 
-		// Convert the speciesScores slice to a slice of species labels
-		var includedSpecies []string
-		for _, speciesScore := range speciesScores {
-			includedSpecies = append(includedSpecies, speciesScore.Label)
-		}
+	// Update location based species list
+	speciesScores, err := a.Bn.GetProbableSpecies(today, 0.0)
+	if err != nil {
+		// Reset the update flag to allow retry on next detection
+		// This prevents the issue where a failed update would block retries until tomorrow
+		a.Settings.ResetRangeFilterUpdateFlag()
 
-		a.Settings.UpdateIncludedSpecies(includedSpecies)
+		GetLogger().Error("Failed to get probable species for range filter",
+			"error", err,
+			"date", today.Format("2006-01-02"),
+			"operation", "update_range_filter")
+		return err
 	}
+
+	// Convert the speciesScores slice to a slice of species labels
+	includedSpecies := make([]string, 0, len(speciesScores))
+	for _, speciesScore := range speciesScores {
+		includedSpecies = append(includedSpecies, speciesScore.Label)
+	}
+
+	// Update the species list (this also updates LastUpdated timestamp atomically)
+	a.Settings.UpdateIncludedSpecies(includedSpecies)
+
+	if a.Settings.Debug {
+		GetLogger().Info("Range filter updated successfully",
+			"species_count", len(includedSpecies),
+			"date", today.Format("2006-01-02"),
+			"operation", "update_range_filter_success")
+		log.Printf("✅ Range filter updated with %d species for %s", len(includedSpecies), today.Format("2006-01-02"))
+	}
+
 	return nil
 }
 
 // Execute broadcasts the detection via Server-Sent Events
-func (a *SSEAction) Execute(data interface{}) error {
+func (a *SSEAction) Execute(data any) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 

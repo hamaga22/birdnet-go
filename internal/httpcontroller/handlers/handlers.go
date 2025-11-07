@@ -3,6 +3,7 @@ package handlers
 import (
 	"fmt"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"runtime/debug"
@@ -18,8 +19,10 @@ import (
 	"github.com/tphakala/birdnet-go/internal/myaudio"
 	"github.com/tphakala/birdnet-go/internal/observability"
 	"github.com/tphakala/birdnet-go/internal/observability/metrics"
+	"github.com/tphakala/birdnet-go/internal/securefs"
 	"github.com/tphakala/birdnet-go/internal/security"
 	"github.com/tphakala/birdnet-go/internal/serviceapi"
+	"github.com/tphakala/birdnet-go/internal/spectrogram"
 	"github.com/tphakala/birdnet-go/internal/suncalc"
 )
 
@@ -28,21 +31,22 @@ var settingsMutex sync.RWMutex
 // Handlers contains all the handler functions and their dependencies
 type Handlers struct {
 	baseHandler
-	DS                datastore.Interface
-	Settings          *conf.Settings
-	DashboardSettings *conf.Dashboard
-	BirdImageCache    *imageprovider.BirdImageCache
-	SSE               *SSEHandler                 // Server Side Events handler
-	SunCalc           *suncalc.SunCalc            // SunCalc instance for calculating sun event times
-	AudioLevelChan    chan myaudio.AudioLevelData // Channel for audio level updates
-	OAuth2Server      *security.OAuth2Server
-	controlChan       chan string
-	notificationChan  chan Notification
-	debug             bool
-	Server            serviceapi.ServerFacade // Server facade providing security and processor access
-	Telemetry         *TelemetryMiddleware    // Telemetry middleware for metrics and enhanced error handling
-	Metrics           *observability.Metrics  // Shared metrics instance
-	rtspAnonymMap     map[string]string       // Maps source IDs to anonymized names for O(1) lookups
+	DS                   datastore.Interface
+	Settings             *conf.Settings
+	DashboardSettings    *conf.Dashboard
+	BirdImageCache       *imageprovider.BirdImageCache
+	SSE                  *SSEHandler                 // Server Side Events handler
+	SunCalc              *suncalc.SunCalc            // SunCalc instance for calculating sun event times
+	AudioLevelChan       chan myaudio.AudioLevelData // Channel for audio level updates
+	OAuth2Server         *security.OAuth2Server
+	controlChan          chan string
+	notificationChan     chan Notification
+	debug                bool
+	Server               serviceapi.ServerFacade // Server facade providing security and processor access
+	Telemetry            *TelemetryMiddleware    // Telemetry middleware for metrics and enhanced error handling
+	Metrics              *observability.Metrics  // Shared metrics instance
+	rtspAnonymMap        map[string]string       // Maps source IDs to anonymized names for O(1) lookups
+	spectrogramGenerator *spectrogram.Generator  // Shared spectrogram generator
 }
 
 // HandlerError is a custom error type that includes an HTTP status code and a user-friendly message.
@@ -93,26 +97,39 @@ func New(ds datastore.Interface, settings *conf.Settings, dashboardSettings *con
 	// Build RTSP anonymization map for O(1) lookups
 	rtspAnonymMap := buildRTSPAnonymizationMap(settings)
 
+	// Initialize SecureFS for spectrogram generation
+	exportPath := settings.Realtime.Audio.Export.Path
+	sfs, err := securefs.New(exportPath)
+	if err != nil {
+		// SecureFS is essential for secure path validation - fail fast
+		logger.Fatalf("Failed to initialize SecureFS for spectrograms: %v. Export path: %s", err, exportPath)
+	}
+
+	// Initialize spectrogram generator with shared generation logic
+	spectrogramLogger := slog.Default().With("service", "htmx_spectrogram_generator")
+	spectrogramGen := spectrogram.NewGenerator(settings, sfs, spectrogramLogger)
+
 	return &Handlers{
 		baseHandler: baseHandler{
 			errorHandler: defaultErrorHandler,
 			logger:       logger,
 		},
-		DS:                ds,
-		Settings:          settings,
-		DashboardSettings: dashboardSettings,
-		BirdImageCache:    birdImageCache,
-		SSE:               NewSSEHandler(),
-		SunCalc:           sunCalc,
-		AudioLevelChan:    audioLevelChan,
-		OAuth2Server:      oauth2Server,
-		controlChan:       controlChan,
-		notificationChan:  notificationChan,
-		debug:             settings.Debug,
-		Server:            server,
-		Telemetry:         NewTelemetryMiddleware(httpMetrics),
-		Metrics:           metricsInstance,
-		rtspAnonymMap:     rtspAnonymMap,
+		DS:                   ds,
+		Settings:             settings,
+		DashboardSettings:    dashboardSettings,
+		BirdImageCache:       birdImageCache,
+		SSE:                  NewSSEHandler(),
+		SunCalc:              sunCalc,
+		AudioLevelChan:       audioLevelChan,
+		OAuth2Server:         oauth2Server,
+		controlChan:          controlChan,
+		notificationChan:     notificationChan,
+		debug:                settings.Debug,
+		Server:               server,
+		Telemetry:            NewTelemetryMiddleware(httpMetrics),
+		Metrics:              metricsInstance,
+		rtspAnonymMap:        rtspAnonymMap,
+		spectrogramGenerator: spectrogramGen,
 	}
 }
 
@@ -120,30 +137,30 @@ func New(ds datastore.Interface, settings *conf.Settings, dashboardSettings *con
 // Maps source IDs to their anonymized names (camera-1, camera-2, etc.)
 func buildRTSPAnonymizationMap(settings *conf.Settings) map[string]string {
 	anonymMap := make(map[string]string)
-	
+
 	if settings == nil || len(settings.Realtime.RTSP.URLs) == 0 {
 		return anonymMap
 	}
-	
+
 	// Get the audio source registry to map URLs to source IDs
 	registry := myaudio.GetRegistry()
 	if registry == nil {
 		return anonymMap
 	}
-	
+
 	// Build the mapping from source ID to anonymized name
 	for i, url := range settings.Realtime.RTSP.URLs {
 		if url == "" {
 			continue
 		}
-		
+
 		// Get the source from registry to get its ID
 		if source, exists := registry.GetSourceByConnection(url); exists {
 			anonymizedName := fmt.Sprintf("camera-%d", i+1)
 			anonymMap[source.ID] = anonymizedName
 		}
 	}
-	
+
 	return anonymMap
 }
 
@@ -208,7 +225,7 @@ func (h *Handlers) HandleError(err error, c echo.Context) error {
 		StackTrace string
 		Settings   *conf.Settings
 		Security   *Security // Use the Security type from handlers package
-		User       interface{}
+		User       any
 		Debug      bool
 	}{
 		Code:       he.Code,

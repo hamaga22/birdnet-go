@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/labstack/echo/v4"
+	"github.com/patrickmn/go-cache"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -633,12 +634,24 @@ func TestDDoSProtection(t *testing.T) {
 	// Setup
 	e, mockDS, controller := setupTestEnvironment(t)
 
-	// Setup mock expectations
-	mockDS.On("SearchNotes", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return([]datastore.Note{}, nil)
-	mockDS.On("CountSearchResults", mock.Anything).Return(int64(0), nil)
+	// Initialize the detection cache manually since routes aren't initialized in test environment
+	controller.detectionCache = cache.New(5*time.Minute, 10*time.Minute)
 
 	// Number of concurrent requests to simulate
 	concurrentRequests := 50
+
+	// Setup mock expectations - with caching enabled and concurrent requests,
+	// multiple requests may check the cache before the first one populates it.
+	// Use Maybe() to allow for race conditions in concurrent testing.
+	mockDS.EXPECT().
+		SearchNotes(mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return([]datastore.Note{}, nil).
+		Maybe() // Multiple requests may call before cache is populated
+
+	mockDS.EXPECT().
+		CountSearchResults(mock.Anything).
+		Return(int64(0), nil).
+		Maybe() // Multiple requests may call before cache is populated
 
 	// Create a wait group to synchronize goroutines
 	// Go 1.25: Using WaitGroup.Go() for automatic Add/Done management
@@ -649,10 +662,10 @@ func TestDDoSProtection(t *testing.T) {
 	statusCodesChan := make(chan int, concurrentRequests)
 
 	// Launch concurrent requests using Go 1.25 WaitGroup.Go() pattern
-	for i := 0; i < concurrentRequests; i++ {
+	for range concurrentRequests {
 		wg.Go(func() {
 			// Create request with query parameters
-			req := httptest.NewRequest(http.MethodGet, "/api/v2/detections?search=test", http.NoBody)
+			req := httptest.NewRequest(http.MethodGet, "/api/v2/detections?queryType=search&search=test", http.NoBody)
 			rec := httptest.NewRecorder()
 			c := e.NewContext(req, rec)
 			c.SetPath("/api/v2/detections")

@@ -218,38 +218,74 @@ func (m *mockStore) GetLockedNotesClipPaths() ([]string, error) { return nil, ni
 func (m *mockStore) CountHourlyDetections(date, hour string, duration int) (int64, error) {
 	return 0, nil
 }
-func (m *mockStore) GetDailyAnalyticsData(startDate, endDate, species string) ([]datastore.DailyAnalyticsData, error) {
+func (m *mockStore) GetDailyAnalyticsData(ctx context.Context, startDate, endDate, species string) ([]datastore.DailyAnalyticsData, error) {
 	return []datastore.DailyAnalyticsData{}, nil
 }
-func (m *mockStore) GetDetectionTrends(period string, limit int) ([]datastore.DailyAnalyticsData, error) {
+func (m *mockStore) GetDetectionTrends(ctx context.Context, period string, limit int) ([]datastore.DailyAnalyticsData, error) {
 	return []datastore.DailyAnalyticsData{}, nil
 }
-func (m *mockStore) GetHourlyAnalyticsData(date, species string) ([]datastore.HourlyAnalyticsData, error) {
+func (m *mockStore) GetHourlyAnalyticsData(ctx context.Context, date, species string) ([]datastore.HourlyAnalyticsData, error) {
 	return []datastore.HourlyAnalyticsData{}, nil
 }
-func (m *mockStore) GetSpeciesSummaryData(startDate, endDate string) ([]datastore.SpeciesSummaryData, error) {
+func (m *mockStore) GetSpeciesSummaryData(ctx context.Context, startDate, endDate string) ([]datastore.SpeciesSummaryData, error) {
 	return []datastore.SpeciesSummaryData{}, nil
 }
 func (m *mockStore) SearchDetections(filters *datastore.SearchFilters) ([]datastore.DetectionRecord, int, error) {
 	return nil, 0, nil
 }
 
+// Dynamic threshold methods
+func (m *mockStore) SaveDynamicThreshold(threshold *datastore.DynamicThreshold) error { return nil }
+func (m *mockStore) GetDynamicThreshold(speciesName string) (*datastore.DynamicThreshold, error) {
+	return nil, fmt.Errorf("not found")
+}
+func (m *mockStore) GetAllDynamicThresholds(limit ...int) ([]datastore.DynamicThreshold, error) {
+	return []datastore.DynamicThreshold{}, nil
+}
+func (m *mockStore) DeleteDynamicThreshold(speciesName string) error { return nil }
+func (m *mockStore) DeleteExpiredDynamicThresholds(before time.Time) (int64, error) {
+	return 0, nil
+}
+func (m *mockStore) UpdateDynamicThresholdExpiry(speciesName string, expiresAt time.Time) error {
+	return nil
+}
+func (m *mockStore) BatchSaveDynamicThresholds(thresholds []datastore.DynamicThreshold) error {
+	return nil
+}
+
 // GetHourlyDistribution implements the datastore.Interface GetHourlyDistribution method
-func (m *mockStore) GetHourlyDistribution(startDate, endDate, species string) ([]datastore.HourlyDistributionData, error) {
+func (m *mockStore) GetHourlyDistribution(ctx context.Context, startDate, endDate, species string) ([]datastore.HourlyDistributionData, error) {
 	// Default implementation returns empty array for this mock
 	return []datastore.HourlyDistributionData{}, nil
 }
 
 // GetNewSpeciesDetections implements the datastore.Interface GetNewSpeciesDetections method
-func (m *mockStore) GetNewSpeciesDetections(startDate, endDate string, limit, offset int) ([]datastore.NewSpeciesData, error) {
+func (m *mockStore) GetNewSpeciesDetections(ctx context.Context, startDate, endDate string, limit, offset int) ([]datastore.NewSpeciesData, error) {
 	// This is a mock test implementation, so we'll return empty data
 	return []datastore.NewSpeciesData{}, nil
 }
 
 // GetSpeciesFirstDetectionInPeriod implements the datastore.Interface GetSpeciesFirstDetectionInPeriod method
-func (m *mockStore) GetSpeciesFirstDetectionInPeriod(startDate, endDate string, limit, offset int) ([]datastore.NewSpeciesData, error) {
+func (m *mockStore) GetSpeciesFirstDetectionInPeriod(ctx context.Context, startDate, endDate string, limit, offset int) ([]datastore.NewSpeciesData, error) {
 	// This is a mock test implementation, so we'll return empty data
 	return []datastore.NewSpeciesData{}, nil
+}
+
+// BG-17 fix: Add notification history methods
+func (m *mockStore) GetActiveNotificationHistory(after time.Time) ([]datastore.NotificationHistory, error) {
+	return []datastore.NotificationHistory{}, nil
+}
+
+func (m *mockStore) GetNotificationHistory(scientificName, notificationType string) (*datastore.NotificationHistory, error) {
+	return nil, datastore.ErrNotificationHistoryNotFound
+}
+
+func (m *mockStore) SaveNotificationHistory(history *datastore.NotificationHistory) error {
+	return nil
+}
+
+func (m *mockStore) DeleteExpiredNotificationHistory(before time.Time) (int64, error) {
+	return 0, nil
 }
 
 // mockFailingStore is a mock implementation that simulates database failures
@@ -296,43 +332,43 @@ func (m *mockFailingStore) GetImageCacheBatch(providerName string, scientificNam
 	return m.mockStore.GetImageCacheBatch(providerName, scientificNames)
 }
 
-func (m *mockFailingStore) GetDailyAnalyticsData(startDate, endDate, species string) ([]datastore.DailyAnalyticsData, error) {
+func (m *mockFailingStore) GetDailyAnalyticsData(ctx context.Context, startDate, endDate, species string) ([]datastore.DailyAnalyticsData, error) {
 	if m.failGetAllCache {
 		return nil, fmt.Errorf("simulated database error")
 	}
-	return m.mockStore.GetDailyAnalyticsData(startDate, endDate, species)
+	return m.mockStore.GetDailyAnalyticsData(ctx, startDate, endDate, species)
 }
 
-func (m *mockFailingStore) GetDetectionTrends(period string, limit int) ([]datastore.DailyAnalyticsData, error) {
+func (m *mockFailingStore) GetDetectionTrends(ctx context.Context, period string, limit int) ([]datastore.DailyAnalyticsData, error) {
 	if m.failGetAllCache {
 		return nil, fmt.Errorf("simulated database error")
 	}
-	return m.mockStore.GetDetectionTrends(period, limit)
+	return m.mockStore.GetDetectionTrends(ctx, period, limit)
 }
 
-func (m *mockFailingStore) GetHourlyAnalyticsData(date, species string) ([]datastore.HourlyAnalyticsData, error) {
+func (m *mockFailingStore) GetHourlyAnalyticsData(ctx context.Context, date, species string) ([]datastore.HourlyAnalyticsData, error) {
 	if m.failGetAllCache {
 		return nil, fmt.Errorf("simulated database error")
 	}
-	return m.mockStore.GetHourlyAnalyticsData(date, species)
+	return m.mockStore.GetHourlyAnalyticsData(ctx, date, species)
 }
 
-func (m *mockFailingStore) GetSpeciesSummaryData(startDate, endDate string) ([]datastore.SpeciesSummaryData, error) {
-	return m.mockStore.GetSpeciesSummaryData(startDate, endDate)
+func (m *mockFailingStore) GetSpeciesSummaryData(ctx context.Context, startDate, endDate string) ([]datastore.SpeciesSummaryData, error) {
+	return m.mockStore.GetSpeciesSummaryData(ctx, startDate, endDate)
 }
 
-func (m *mockFailingStore) GetNewSpeciesDetections(startDate, endDate string, limit, offset int) ([]datastore.NewSpeciesData, error) {
+func (m *mockFailingStore) GetNewSpeciesDetections(ctx context.Context, startDate, endDate string, limit, offset int) ([]datastore.NewSpeciesData, error) {
 	if m.failGetAllCache {
 		return nil, fmt.Errorf("simulated database error")
 	}
-	return m.mockStore.GetNewSpeciesDetections(startDate, endDate, limit, offset)
+	return m.mockStore.GetNewSpeciesDetections(ctx, startDate, endDate, limit, offset)
 }
 
-func (m *mockFailingStore) GetSpeciesFirstDetectionInPeriod(startDate, endDate string, limit, offset int) ([]datastore.NewSpeciesData, error) {
+func (m *mockFailingStore) GetSpeciesFirstDetectionInPeriod(ctx context.Context, startDate, endDate string, limit, offset int) ([]datastore.NewSpeciesData, error) {
 	if m.failGetAllCache {
 		return nil, fmt.Errorf("simulated database error")
 	}
-	return m.mockStore.GetSpeciesFirstDetectionInPeriod(startDate, endDate, limit, offset)
+	return m.mockStore.GetSpeciesFirstDetectionInPeriod(ctx, startDate, endDate, limit, offset)
 }
 
 // TestBirdImageCache tests the BirdImageCache implementation
@@ -708,7 +744,7 @@ func TestConcurrentInitialization(t *testing.T) {
 	errs := make(chan error, numRequests)
 
 	// Launch concurrent requests
-	for i := 0; i < numRequests; i++ {
+	for range numRequests {
 		go func() {
 			defer wg.Done()
 			image, err := cache.Get(scientificName)
@@ -800,10 +836,9 @@ func TestInitializationTimeout(t *testing.T) {
 
 	// Check duration: main Get should wait for approx. 1.9s for the 2s background fetch.
 	// Set a minimum expected duration to ensure the second call actually waits for the first fetch
-	minExpectedWait := mockProvider.fetchDelay - (200 * time.Millisecond) // Allow some leeway
-	if minExpectedWait < 0 {
-		minExpectedWait = 0
-	}
+	minExpectedWait := max(
+		// Allow some leeway
+		mockProvider.fetchDelay-(200*time.Millisecond), 0)
 	// Max expected duration can be a bit more than fetch delay for overhead.
 	maxExpectedDuration := mockProvider.fetchDelay + (1 * time.Second)
 
@@ -898,7 +933,7 @@ func TestUserRequestsNotRateLimited(t *testing.T) {
 	start := time.Now()
 
 	// Make rapid consecutive requests (should not be rate limited)
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		species := testSpecies[i%len(testSpecies)]
 		_, err := cache.Get(species)
 		if err != nil && !errors.Is(err, imageprovider.ErrImageNotFound) {
@@ -951,7 +986,7 @@ func TestBackgroundRequestsRateLimited(t *testing.T) {
 	// Pre-populate with stale entries to trigger background refresh
 	staleTime := time.Now().Add(-15 * 24 * time.Hour)
 	numStaleEntries := 5
-	for i := 0; i < numStaleEntries; i++ {
+	for i := range numStaleEntries {
 		species := fmt.Sprintf("StaleSpecies_%d", i)
 		if err := mockStore.SaveImageCache(&datastore.ImageCache{
 			ScientificName: species,

@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"math/big"
 	"os/exec"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -79,6 +80,11 @@ const (
 	// Timeout settings for FFmpeg RTSP streams
 	defaultTimeoutMicroseconds = 10000000 // 10 seconds in microseconds
 	minTimeoutMicroseconds     = 1000000  // 1 second in microseconds
+
+	// FFmpeg error tracking settings
+	maxErrorHistorySize       = 100             // Maximum number of error contexts to store internally per stream
+	maxErrorHistoryExposed    = 10              // Number of most recent errors exposed via StreamHealth API
+	earlyErrorDetectionWindow = 5 * time.Second // Check stderr in first 5 seconds for early detection
 )
 
 // Use shared logger from integration file
@@ -163,14 +169,14 @@ func (d *dataRateCalculator) getRate() float64 {
 		// rather an instantaneous rate estimate for display purposes.
 		sample := d.samples[0]
 		timeSinceSample := time.Since(sample.timestamp)
-		
+
 		// If sample is recent (within 5 seconds), show instantaneous rate
 		// This helps new streams show data rate immediately
 		if timeSinceSample < 5*time.Second {
 			// Return the burst size as bytes/second (instantaneous estimate)
 			return float64(sample.bytes)
 		}
-		
+
 		// Old single sample - no meaningful rate
 		return 0
 	}
@@ -199,6 +205,93 @@ func secondsSinceOrZero(t time.Time) float64 {
 	return time.Since(t).Seconds()
 }
 
+// formatLastDataDescription returns a human-readable description of when data was last received.
+// Returns "never received data" for zero time, or "X.Xs ago" for recent data.
+// This is used for user-facing log messages and error contexts.
+func formatLastDataDescription(t time.Time) string {
+	if t.IsZero() {
+		return "never received data"
+	}
+	return fmt.Sprintf("%.1fs ago", time.Since(t).Seconds())
+}
+
+// ProcessState represents the current lifecycle state of an FFmpeg process
+type ProcessState int
+
+const (
+	// StateIdle indicates the stream is created but Run() has not been called yet
+	StateIdle ProcessState = iota
+	// StateStarting indicates the FFmpeg process is being started (in startProcess())
+	StateStarting
+	// StateRunning indicates the FFmpeg process is running and processing audio
+	StateRunning
+	// StateRestarting indicates a restart has been requested
+	StateRestarting
+	// StateBackoff indicates the stream is waiting before restart (exponential backoff)
+	StateBackoff
+	// StateCircuitOpen indicates the circuit breaker is open (waiting for cooldown)
+	StateCircuitOpen
+	// StateStopped indicates the stream has been permanently stopped
+	StateStopped
+)
+
+// String returns a human-readable name for the process state
+func (s ProcessState) String() string {
+	switch s {
+	case StateIdle:
+		return "idle"
+	case StateStarting:
+		return "starting"
+	case StateRunning:
+		return "running"
+	case StateRestarting:
+		return "restarting"
+	case StateBackoff:
+		return "backoff"
+	case StateCircuitOpen:
+		return "circuit_open"
+	case StateStopped:
+		return "stopped"
+	default:
+		return fmt.Sprintf("unknown(%d)", s)
+	}
+}
+
+// StateTransition records a transition between process states for debugging
+type StateTransition struct {
+	From      ProcessState
+	To        ProcessState
+	Timestamp time.Time
+	Reason    string
+}
+
+// validStateTransitions defines the allowed state transitions for validation.
+// This prevents invalid state transitions and makes the state machine behavior explicit.
+var validStateTransitions = map[ProcessState][]ProcessState{
+	StateIdle:        {StateStarting, StateStopped},                                   // Can start or be stopped
+	StateStarting:    {StateRunning, StateBackoff, StateCircuitOpen, StateStopped},    // Can succeed, fail, or be stopped
+	StateRunning:     {StateRestarting, StateBackoff, StateCircuitOpen, StateStopped}, // Can restart, fail, or be stopped
+	StateRestarting:  {StateStarting, StateBackoff, StateCircuitOpen, StateStopped},   // Can attempt start or enter waiting state
+	StateBackoff:     {StateStarting, StateCircuitOpen, StateStopped},                 // Can retry, open circuit, or be stopped
+	StateCircuitOpen: {StateStarting, StateStopped},                                   // Can retry after cooldown or be stopped
+	StateStopped:     {},                                                              // Terminal state - no transitions allowed
+}
+
+// isValidTransition checks if a state transition is allowed
+func isValidTransition(from, to ProcessState) bool {
+	// Always allow transitions to the same state (idempotent)
+	if from == to {
+		return true
+	}
+
+	allowedTransitions, exists := validStateTransitions[from]
+	if !exists {
+		return false
+	}
+
+	return slices.Contains(allowedTransitions, to)
+}
+
 // StreamHealth represents the health status of an FFmpeg stream.
 // It provides metrics about data reception, restart attempts, and overall stream health.
 type StreamHealth struct {
@@ -210,6 +303,13 @@ type StreamHealth struct {
 	TotalBytesReceived int64
 	BytesPerSecond     float64
 	IsReceivingData    bool
+	// Process state information
+	ProcessState ProcessState      // Current process state
+	StateHistory []StateTransition // Recent state transitions (last 10 for health checks)
+	// FFmpeg error diagnostics
+	// Note: Internally stores up to 100 errors for analysis, but only exposes the 10 most recent
+	LastErrorContext *ErrorContext   // Most recent error detected
+	ErrorHistory     []*ErrorContext // Recent error history (last 10 for diagnostics)
 }
 
 // FFmpegStream manages a single FFmpeg process for audio streaming.
@@ -228,8 +328,8 @@ type FFmpegStream struct {
 
 	// State management
 	ctx         context.Context
-	cancel      context.CancelFunc
-	cancelMu    sync.RWMutex // Protect cancel function access
+	cancel      context.CancelCauseFunc // Changed to CancelCauseFunc for better diagnostics
+	cancelMu    sync.RWMutex            // Protect cancel function access
 	restartChan chan struct{}
 	stopChan    chan struct{}
 	stopOnce    sync.Once // Ensure Stop() is idempotent
@@ -278,6 +378,17 @@ type FFmpegStream struct {
 
 	// Stream creation time for grace period calculation
 	streamCreatedAt time.Time
+
+	// Process state tracking
+	processState     ProcessState
+	processStateMu   sync.RWMutex
+	stateTransitions []StateTransition
+	transitionsMu    sync.Mutex
+
+	// FFmpeg error tracking for diagnostics
+	errorContexts   []*ErrorContext // Ring buffer of last N errors
+	errorContextsMu sync.RWMutex
+	maxErrorHistory int // Maximum number of error contexts to store
 }
 
 // threadSafeWriter wraps a bytes.Buffer with mutex protection for concurrent access
@@ -297,14 +408,14 @@ func (w *threadSafeWriter) Write(p []byte) (n int, err error) {
 func generateUniqueFallbackID() string {
 	// Use timestamp + random component for uniqueness
 	timestamp := time.Now().Unix()
-	
+
 	// Generate random component
 	randomNum, err := rand.Int(rand.Reader, big.NewInt(10000))
 	if err != nil {
 		// Fallback to just timestamp if random fails
 		return fmt.Sprintf("fallback_rtsp_%d", timestamp)
 	}
-	
+
 	return fmt.Sprintf("fallback_rtsp_%d_%d", timestamp, randomNum.Int64())
 }
 
@@ -315,7 +426,7 @@ func NewFFmpegStream(url, transport string, audioChan chan UnifiedAudioData) *FF
 	// Register or get existing source from registry
 	registry := GetRegistry()
 	var source *AudioSource
-	
+
 	if registry == nil {
 		log.Printf("⚠️ Registry not available during startup, creating fallback source: %s", privacy.SanitizeRTSPUrl(url))
 		// Create fallback source when registry is unavailable
@@ -358,9 +469,136 @@ func NewFFmpegStream(url, transport string, audioChan chan UnifiedAudioData) *FF
 		lastDataTime:                   time.Time{}, // Zero time - no data received yet
 		dataRateCalc:                   newDataRateCalculator(source.SafeString, dataRateWindowSize),
 		lastDropLogTime:                time.Now(),
-		lastSoundLevelNotRegisteredLog: time.Now().Add(-dropLogInterval), // Allow immediate first log
-		streamCreatedAt:                time.Now(),                       // Track when stream was created
+		lastSoundLevelNotRegisteredLog: time.Now().Add(-dropLogInterval),              // Allow immediate first log
+		streamCreatedAt:                time.Now(),                                    // Track when stream was created
+		processState:                   StateIdle,                                     // Initial state is idle
+		stateTransitions:               make([]StateTransition, 0, 100),               // Pre-allocate for 100 transitions
+		errorContexts:                  make([]*ErrorContext, 0, maxErrorHistorySize), // Pre-allocate error history
+		maxErrorHistory:                maxErrorHistorySize,
 	}
+}
+
+// transitionState safely transitions the process state and logs the change.
+// It records the transition in history for debugging and emits structured logs.
+// This method is thread-safe and can be called from any goroutine.
+//
+// Lenient mode: Invalid transitions are logged in debug mode but still applied
+// to ensure operations don't get blocked. This makes the system more robust
+// and user-friendly by allowing recovery from unexpected states.
+//
+// Idempotent transitions (same state to same state) are silently ignored to
+// reduce log noise and avoid unnecessary history entries.
+func (s *FFmpegStream) transitionState(to ProcessState, reason string) {
+	s.processStateMu.Lock()
+	from := s.processState
+
+	// Skip idempotent transitions (no-op) to reduce log noise
+	if from == to {
+		s.processStateMu.Unlock()
+		if conf.Setting().Debug {
+			streamLogger.Debug("idempotent state transition ignored",
+				"url", privacy.SanitizeRTSPUrl(s.source.SafeString),
+				"source_id", s.source.ID,
+				"state", from.String(),
+				"reason", reason,
+				"component", "ffmpeg-stream",
+				"operation", "state_transition_noop")
+		}
+		return
+	}
+
+	// Terminal state safeguard: never allow leaving StateStopped
+	// This ensures Stop() remains truly terminal and prevents inconsistent state
+	if from == StateStopped && to != StateStopped {
+		s.processStateMu.Unlock()
+		streamLogger.Warn("blocked transition out of terminal state",
+			"url", privacy.SanitizeRTSPUrl(s.source.SafeString),
+			"source_id", s.source.ID,
+			"from", from.String(),
+			"to", to.String(),
+			"reason", reason,
+			"component", "ffmpeg-stream",
+			"operation", "state_transition_blocked")
+		if conf.Setting().Debug {
+			log.Printf("🚫 Blocked transition out of terminal state for %s: %s → %s (reason: %s)",
+				privacy.SanitizeRTSPUrl(s.source.SafeString),
+				from.String(), to.String(), reason)
+		}
+		return
+	}
+
+	// Validate transition (lenient: warn in debug mode but still apply)
+	if !isValidTransition(from, to) {
+		// Only log in debug mode to avoid noise in production
+		if conf.Setting().Debug {
+			streamLogger.Warn("invalid state transition detected (applying anyway for robustness)",
+				"url", privacy.SanitizeRTSPUrl(s.source.SafeString),
+				"source_id", s.source.ID,
+				"from", from.String(),
+				"to", to.String(),
+				"reason", reason,
+				"component", "ffmpeg-stream",
+				"operation", "state_transition_invalid")
+
+			log.Printf("⚠️ Invalid state transition for %s: %s → %s (reason: %s) - applying anyway",
+				privacy.SanitizeRTSPUrl(s.source.SafeString),
+				from.String(), to.String(), reason)
+		}
+	}
+
+	s.processState = to
+	s.processStateMu.Unlock()
+
+	// Record transition for debugging
+	transition := StateTransition{
+		From:      from,
+		To:        to,
+		Timestamp: time.Now(),
+		Reason:    reason,
+	}
+
+	s.transitionsMu.Lock()
+	s.stateTransitions = append(s.stateTransitions, transition)
+	// Keep only last 100 transitions to prevent unbounded memory growth
+	if len(s.stateTransitions) > 100 {
+		// Efficiently remove oldest transitions by slicing
+		s.stateTransitions = s.stateTransitions[len(s.stateTransitions)-100:]
+	}
+	s.transitionsMu.Unlock()
+
+	// Log state transition with structured logging
+	streamLogger.Info("process state transition",
+		"url", privacy.SanitizeRTSPUrl(s.source.SafeString),
+		"source_id", s.source.ID,
+		"from", from.String(),
+		"to", to.String(),
+		"reason", reason,
+		"component", "ffmpeg-stream",
+		"operation", "state_transition")
+
+	// Also log with emoji for console visibility
+	if conf.Setting().Debug {
+		log.Printf("🔄 State transition for %s: %s → %s (%s)",
+			privacy.SanitizeRTSPUrl(s.source.SafeString),
+			from.String(), to.String(), reason)
+	}
+}
+
+// GetProcessState returns the current process state (thread-safe)
+func (s *FFmpegStream) GetProcessState() ProcessState {
+	s.processStateMu.RLock()
+	defer s.processStateMu.RUnlock()
+	return s.processState
+}
+
+// GetStateHistory returns recent state transitions for debugging (thread-safe)
+// Returns a copy to avoid race conditions with ongoing transitions
+func (s *FFmpegStream) GetStateHistory() []StateTransition {
+	s.transitionsMu.Lock()
+	defer s.transitionsMu.Unlock()
+
+	// Return a copy to avoid race conditions
+	return slices.Clone(s.stateTransitions)
 }
 
 // Run starts and manages the FFmpeg process lifecycle.
@@ -372,19 +610,20 @@ func (s *FFmpegStream) Run(parentCtx context.Context) {
 		log.Printf("❌ Cannot start FFmpeg stream: source is nil")
 		return
 	}
-	
+
 	// Set context and cancel function with proper locking
+	// Use WithCancelCause for better cancellation diagnostics
 	func() {
 		s.cancelMu.Lock()
 		defer s.cancelMu.Unlock()
-		s.ctx, s.cancel = context.WithCancel(parentCtx)
+		s.ctx, s.cancel = context.WithCancelCause(parentCtx)
 	}()
 
 	defer func() {
 		s.cancelMu.Lock()
 		defer s.cancelMu.Unlock()
 		if s.cancel != nil {
-			s.cancel()
+			s.cancel(fmt.Errorf("FFmpegStream: Run() loop exiting for %s", privacy.SanitizeRTSPUrl(s.source.SafeString)))
 		}
 	}()
 
@@ -398,6 +637,8 @@ func (s *FFmpegStream) Run(parentCtx context.Context) {
 			// Start FFmpeg process
 			// Check circuit breaker and wait only for remaining cooldown
 			if remaining, open := s.circuitCooldownRemaining(); open {
+				// Transition to circuit breaker state before waiting
+				s.transitionState(StateCircuitOpen, fmt.Sprintf("circuit breaker cooldown: %s remaining", FormatDuration(remaining)))
 				// Wait only the remaining cooldown before next attempt
 				select {
 				case <-time.After(remaining):
@@ -409,6 +650,9 @@ func (s *FFmpegStream) Run(parentCtx context.Context) {
 				}
 			}
 
+			// STATE TRANSITION: idle/backoff → starting (attempting to start FFmpeg process)
+			s.transitionState(StateStarting, "initiating FFmpeg process start")
+
 			if err := s.startProcess(); err != nil {
 				streamLogger.Error("failed to start FFmpeg process",
 					"url", privacy.SanitizeRTSPUrl(s.source.SafeString),
@@ -417,9 +661,23 @@ func (s *FFmpegStream) Run(parentCtx context.Context) {
 					"operation", "start_process")
 				log.Printf("❌ Failed to start FFmpeg for %s: %v", privacy.SanitizeRTSPUrl(s.source.SafeString), err)
 				s.recordFailure(0) // No runtime for startup failure
-				s.handleRestartBackoff()
+				// STATE TRANSITION: starting → backoff (start failed, entering backoff)
+				// Apply backoff UNLESS circuit breaker was opened
+				// If circuit breaker is open, let the Run() loop handle the cooldown wait at line 629-641
+				currentState := s.GetProcessState()
+				if currentState != StateCircuitOpen {
+					s.handleRestartBackoff() // This will transition to StateBackoff internally
+				} else if conf.Setting().Debug {
+					streamLogger.Debug("skipping backoff transition - circuit breaker is open (startup failure)",
+						"url", privacy.SanitizeRTSPUrl(s.source.SafeString),
+						"state", currentState.String(),
+						"operation", "skip_backoff_circuit_open_startup")
+				}
 				continue
 			}
+
+			// STATE TRANSITION: starting → running (FFmpeg successfully started)
+			s.transitionState(StateRunning, "FFmpeg process started successfully")
 
 			// Process audio data
 			err := s.processAudio()
@@ -457,7 +715,7 @@ func (s *FFmpegStream) Run(parentCtx context.Context) {
 					"runtime_seconds", runtime.Seconds(),
 					"component", "ffmpeg-stream",
 					"operation", "process_ended")
-				log.Printf("⚠️ FFmpeg process ended for %s after %v: %v", privacy.SanitizeRTSPUrl(s.source.SafeString), runtime, sanitizedError)
+				log.Printf("⚠️ FFmpeg process ended for %s after %s: %v", privacy.SanitizeRTSPUrl(s.source.SafeString), FormatDuration(runtime), sanitizedError)
 
 				// Reset restart count for silence timeouts as they're expected
 				if isSilenceTimeout {
@@ -482,7 +740,7 @@ func (s *FFmpegStream) Run(parentCtx context.Context) {
 					"runtime_seconds", runtime.Seconds(),
 					"component", "ffmpeg-stream",
 					"operation", "process_ended")
-				log.Printf("✅ FFmpeg process ended normally for %s after %v", privacy.SanitizeRTSPUrl(s.source.SafeString), runtime)
+				log.Printf("✅ FFmpeg process ended normally for %s after %s", privacy.SanitizeRTSPUrl(s.source.SafeString), FormatDuration(runtime))
 				// Reset failure count on successful run
 				s.resetFailures()
 			}
@@ -497,8 +755,18 @@ func (s *FFmpegStream) Run(parentCtx context.Context) {
 			}
 			s.cleanupProcess()
 
-			// Apply backoff before restart
-			s.handleRestartBackoff()
+			// STATE TRANSITION: running → backoff (process ended, entering backoff before restart)
+			// Apply backoff before restart UNLESS circuit breaker was opened
+			// If circuit breaker is open, let the Run() loop handle the cooldown wait at line 629-641
+			currentState := s.GetProcessState()
+			if currentState != StateCircuitOpen {
+				s.handleRestartBackoff() // This will transition to StateBackoff internally
+			} else if conf.Setting().Debug {
+				streamLogger.Debug("skipping backoff transition - circuit breaker is open",
+					"url", privacy.SanitizeRTSPUrl(s.source.SafeString),
+					"state", currentState.String(),
+					"operation", "skip_backoff_circuit_open")
+			}
 		}
 	}
 }
@@ -566,7 +834,7 @@ func (s *FFmpegStream) startProcess() error {
 			Context("operation", "start_process").
 			Build()
 	}
-	
+
 	// Get and validate connection string
 	connStr, err := s.source.GetConnectionString()
 	if err != nil {
@@ -578,7 +846,7 @@ func (s *FFmpegStream) startProcess() error {
 			Context("url", privacy.SanitizeRTSPUrl(s.source.SafeString)).
 			Build()
 	}
-	
+
 	// Prevent FFmpeg from starting with empty input which causes hard-to-debug restart loops
 	if connStr == "" {
 		return errors.Newf("connection string is empty for source %s, cannot start FFmpeg", s.source.ID).
@@ -679,6 +947,173 @@ func (s *FFmpegStream) startProcess() error {
 	return nil
 }
 
+// handleSilenceTimeout checks if stream has stopped producing data and triggers restart
+// Returns an error if silence timeout is exceeded, nil otherwise
+func (s *FFmpegStream) handleSilenceTimeout(startTime time.Time) error {
+	s.lastDataMu.RLock()
+	lastData := s.lastDataTime
+	s.lastDataMu.RUnlock()
+
+	// Determine effective "no-data" age: if never received any data, use process runtime
+	effectiveAge := func() time.Duration {
+		if lastData.IsZero() {
+			s.cmdMu.Lock()
+			ps := s.processStartTime
+			s.cmdMu.Unlock()
+			if ps.IsZero() {
+				return 0 // no running process; skip
+			}
+			return time.Since(ps)
+		}
+		return time.Since(lastData)
+	}()
+
+	if effectiveAge > 0 && effectiveAge > silenceTimeout {
+		// Format last data description for clearer logging
+		lastDataDesc := formatLastDataDescription(lastData)
+
+		streamLogger.Warn("no data received from RTSP source, triggering restart",
+			"url", privacy.SanitizeRTSPUrl(s.source.SafeString),
+			"timeout_seconds", silenceTimeout.Seconds(),
+			"last_data", lastDataDesc,
+			"effective_age_seconds", effectiveAge.Seconds(),
+			"process_runtime_seconds", time.Since(startTime).Seconds(),
+			"component", "ffmpeg-stream",
+			"operation", "silence_detected")
+		log.Printf("⚠️ No data from %s (last data: %s, timeout: %s), restarting stream",
+			privacy.SanitizeRTSPUrl(s.source.SafeString), lastDataDesc, FormatDuration(effectiveAge))
+		s.cleanupProcess()
+		return errors.Newf("stream stopped producing data for %v seconds", silenceTimeout.Seconds()).
+			Category(errors.CategoryRTSP).
+			Component("ffmpeg-stream").
+			Priority(errors.PriorityMedium).
+			Context("operation", "silence_timeout").
+			Context("url", privacy.SanitizeRTSPUrl(s.source.SafeString)).
+			Context("timeout_seconds", silenceTimeout.Seconds()).
+			Context("last_data", lastDataDesc).
+			Build()
+	}
+
+	return nil
+}
+
+// handleEarlyErrorDetection checks stderr for early errors and takes appropriate action
+// Returns an error if a permanent failure is detected, nil if no action needed
+func (s *FFmpegStream) handleEarlyErrorDetection() error {
+	errCtx := s.checkEarlyErrors()
+	if errCtx == nil {
+		return nil
+	}
+
+	// Record error context
+	s.recordErrorContext(errCtx)
+
+	// Log user-friendly message to console
+	log.Printf("⚠️ %s", errCtx.FormatForConsole())
+
+	// Take action based on error type
+	if errCtx.ShouldOpenCircuit() {
+		// Open circuit breaker immediately for permanent failures
+		streamLogger.Error("early error triggers circuit breaker",
+			"url", privacy.SanitizeRTSPUrl(s.source.SafeString),
+			"error_type", errCtx.ErrorType,
+			"component", "ffmpeg-stream",
+			"operation", "early_error_circuit_break")
+
+		s.circuitMu.Lock()
+		s.consecutiveFailures = circuitBreakerThreshold
+		s.circuitOpenTime = time.Now()
+		s.circuitMu.Unlock()
+
+		s.transitionState(StateCircuitOpen, fmt.Sprintf("early FFmpeg error: %s", errCtx.ErrorType))
+		s.cleanupProcess()
+		return errors.Newf("early FFmpeg error: %s", errCtx.PrimaryMessage).
+			Category(errors.CategoryRTSP).
+			Component("ffmpeg-stream").
+			Priority(errors.PriorityMedium).
+			Context("operation", "early_error_detection").
+			Context("url", privacy.SanitizeRTSPUrl(s.source.SafeString)).
+			Context("error_type", errCtx.ErrorType).
+			Build()
+	}
+
+	if errCtx.ShouldRestart() {
+		// Transient error - trigger restart
+		streamLogger.Warn("early error triggers restart",
+			"url", privacy.SanitizeRTSPUrl(s.source.SafeString),
+			"error_type", errCtx.ErrorType,
+			"component", "ffmpeg-stream",
+			"operation", "early_error_restart")
+
+		s.cleanupProcess()
+		return errors.Newf("early FFmpeg error (transient): %s", errCtx.PrimaryMessage).
+			Category(errors.CategoryRTSP).
+			Component("ffmpeg-stream").
+			Priority(errors.PriorityMedium).
+			Context("operation", "early_error_detection").
+			Context("url", privacy.SanitizeRTSPUrl(s.source.SafeString)).
+			Context("error_type", errCtx.ErrorType).
+			Build()
+	}
+
+	return nil
+}
+
+// handleQuickExitError processes quick exit scenarios (process exits within processQuickExitTime)
+// and returns an appropriate error with error context extraction
+func (s *FFmpegStream) handleQuickExitError(startTime time.Time) error {
+	// Get stderr output safely
+	s.stderrMu.RLock()
+	stderrOutput := s.stderr.String()
+	s.stderrMu.RUnlock()
+
+	// Try to extract structured error context
+	errCtx := ExtractErrorContext(stderrOutput)
+	if errCtx != nil {
+		// Record error context for diagnostics
+		s.recordErrorContext(errCtx)
+
+		// Log user-friendly message
+		log.Printf("⚠️ %s", errCtx.FormatForConsole())
+
+		// If this is a permanent failure, open circuit breaker
+		if errCtx.ShouldOpenCircuit() {
+			s.circuitMu.Lock()
+			s.consecutiveFailures = circuitBreakerThreshold
+			s.circuitOpenTime = time.Now()
+			s.circuitMu.Unlock()
+
+			s.transitionState(StateCircuitOpen, fmt.Sprintf("early exit with error: %s", errCtx.ErrorType))
+		}
+
+		// Return structured error
+		return errors.Newf("FFmpeg process failed to start properly: %s", errCtx.PrimaryMessage).
+			Category(errors.CategoryRTSP).
+			Component("ffmpeg-stream").
+			Priority(errors.PriorityMedium).
+			Context("operation", "process_audio_quick_exit").
+			Context("url", privacy.SanitizeRTSPUrl(s.source.SafeString)).
+			Context("transport", s.transport).
+			Context("exit_time_seconds", time.Since(startTime).Seconds()).
+			Context("error_type", errCtx.ErrorType).
+			Build()
+	}
+
+	// No structured error context - fall back to generic error
+	// Sanitize stderr output to remove sensitive data and memory addresses
+	sanitizedOutput := privacy.SanitizeFFmpegError(stderrOutput)
+	return errors.Newf("FFmpeg process failed to start properly: %s", sanitizedOutput).
+		Category(errors.CategoryRTSP).
+		Component("ffmpeg-stream").
+		Priority(errors.PriorityMedium).
+		Context("operation", "process_audio").
+		Context("url", privacy.SanitizeRTSPUrl(s.source.SafeString)).
+		Context("transport", s.transport).
+		Context("exit_time_seconds", time.Since(startTime).Seconds()).
+		Context("error_detail", sanitizedOutput).
+		Build()
+}
+
 // processAudio reads and processes audio data from FFmpeg
 func (s *FFmpegStream) processAudio() error {
 	buf := make([]byte, ffmpegBufferSize)
@@ -702,33 +1137,49 @@ func (s *FFmpegStream) processAudio() error {
 		}
 	}()
 
-	// Reset data counters
-	s.bytesReceivedMu.Lock()
-	s.totalBytesReceived = 0
-	s.bytesReceivedMu.Unlock()
+	// Create a ticker for early error detection (first 5 seconds)
+	// Check stderr every 500ms during early window to catch errors quickly
+	earlyErrorCheckTicker := time.NewTicker(500 * time.Millisecond)
+	defer earlyErrorCheckTicker.Stop()
+
+	earlyErrorCheckEnabled := true
+	earlyErrorCheckTimer := time.NewTimer(earlyErrorDetectionWindow)
+	defer func() {
+		if !earlyErrorCheckTimer.Stop() {
+			select {
+			case <-earlyErrorCheckTimer.C:
+			default:
+			}
+		}
+	}()
+
+	// Reset data tracking for new process
+	s.resetDataTracking()
 
 	for {
-		// Set read deadline for timeout handling
-		n, err := s.stdout.Read(buf)
+		// Check if stream has been stopped before attempting to read
+		// This prevents nil pointer dereference when Stop() is called during startup
+		if s.GetProcessState() == StateStopped {
+			return nil
+		}
+
+		// Safely get stdout reference to prevent nil pointer dereference
+		// when Stop() calls cleanupProcess() during concurrent operation
+		s.cmdMu.Lock()
+		stdout := s.stdout
+		s.cmdMu.Unlock()
+
+		// If stdout is nil, the process was cleaned up (likely by Stop())
+		if stdout == nil {
+			return nil
+		}
+
+		// Read from FFmpeg stdout (exec pipes do not support read deadlines)
+		n, err := stdout.Read(buf)
 		if err != nil {
 			// Check if process exited too quickly
 			if time.Since(startTime) < processQuickExitTime {
-				// Get stderr output safely
-				s.stderrMu.RLock()
-				stderrOutput := s.stderr.String()
-				s.stderrMu.RUnlock()
-				// Sanitize stderr output to remove sensitive data and memory addresses
-				sanitizedOutput := privacy.SanitizeFFmpegError(stderrOutput)
-				return errors.Newf("FFmpeg process failed to start properly: %s", sanitizedOutput).
-					Category(errors.CategoryRTSP).
-					Component("ffmpeg-stream").
-					Priority(errors.PriorityMedium).
-					Context("operation", "process_audio").
-					Context("url", privacy.SanitizeRTSPUrl(s.source.SafeString)).
-					Context("transport", s.transport).
-					Context("exit_time_seconds", time.Since(startTime).Seconds()).
-					Context("error_detail", sanitizedOutput).
-					Build()
+				return s.handleQuickExitError(startTime)
 			}
 
 			if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) {
@@ -792,46 +1243,32 @@ func (s *FFmpegStream) processAudio() error {
 				healthCheckDone = true
 				s.logStreamHealth()
 			}
+		case <-earlyErrorCheckTimer.C:
+			// Disable early error checking after the window expires
+			earlyErrorCheckEnabled = false
+			earlyErrorCheckTicker.Stop()
+			// Drain ticker channel to prevent goroutine leak
+			select {
+			case <-earlyErrorCheckTicker.C:
+			default:
+			}
+			if conf.Setting().Debug {
+				streamLogger.Debug("early error detection window closed",
+					"url", privacy.SanitizeRTSPUrl(s.source.SafeString),
+					"duration_seconds", earlyErrorDetectionWindow.Seconds(),
+					"operation", "early_error_window_close")
+			}
+		case <-earlyErrorCheckTicker.C:
+			// Check for early errors only if window is still open
+			if earlyErrorCheckEnabled {
+				if err := s.handleEarlyErrorDetection(); err != nil {
+					return err
+				}
+			}
 		case <-silenceCheckTicker.C:
 			// Check for silence timeout
-			s.lastDataMu.RLock()
-			lastData := s.lastDataTime
-			s.lastDataMu.RUnlock()
-
-			// Determine effective "no-data" age: if never received any data, use process runtime
-			effectiveAge := func() time.Duration {
-				if lastData.IsZero() {
-					s.cmdMu.Lock()
-					ps := s.processStartTime
-					s.cmdMu.Unlock()
-					if ps.IsZero() {
-						return 0 // no running process; skip
-					}
-					return time.Since(ps)
-				}
-				return time.Since(lastData)
-			}()
-
-			if effectiveAge > 0 && effectiveAge > silenceTimeout {
-				streamLogger.Warn("no data received from RTSP source, triggering restart",
-					"url", privacy.SanitizeRTSPUrl(s.source.SafeString),
-					"timeout_seconds", silenceTimeout.Seconds(),
-					"last_data_ago_seconds", secondsSinceOrZero(lastData),
-					"effective_age_seconds", effectiveAge.Seconds(),
-					"component", "ffmpeg-stream",
-					"operation", "silence_detected")
-				log.Printf("⚠️ No data from %s for %v, restarting stream", privacy.SanitizeRTSPUrl(s.source.SafeString), effectiveAge)
-				s.cleanupProcess()
-				return errors.Newf("stream stopped producing data for %v seconds", silenceTimeout.Seconds()).
-					Category(errors.CategoryRTSP).
-					Component("ffmpeg-stream").
-					Priority(errors.PriorityMedium).
-					Context("operation", "silence_timeout").
-					Context("url", privacy.SanitizeRTSPUrl(s.source.SafeString)).
-					Context("timeout_seconds", silenceTimeout.Seconds()).
-					Context("last_data_seconds_ago", secondsSinceOrZero(lastData)).
-					Context("effective_age_seconds", effectiveAge.Seconds()).
-					Build()
+			if err := s.handleSilenceTimeout(startTime); err != nil {
+				return err
 			}
 		default:
 			// Continue processing
@@ -955,6 +1392,30 @@ func (s *FFmpegStream) logDroppedData() {
 	}
 }
 
+// logContextCause logs the context cancellation cause if available.
+// Extracted as a helper function to reduce cyclomatic complexity of cleanupProcess.
+func (s *FFmpegStream) logContextCause(pid int) {
+	// Acquire read lock to safely access s.ctx (protected by cancelMu)
+	s.cancelMu.RLock()
+	ctx := s.ctx
+	s.cancelMu.RUnlock()
+
+	if ctx == nil {
+		return
+	}
+
+	cause := context.Cause(ctx)
+	// Log only if cause exists and is not the standard context.Canceled sentinel
+	if cause != nil && !errors.Is(cause, context.Canceled) {
+		streamLogger.Debug("cleanup triggered by context cancellation",
+			"url", privacy.SanitizeRTSPUrl(s.source.SafeString),
+			"pid", pid,
+			"cause", cause.Error(),
+			"component", "ffmpeg-stream",
+			"operation", "cleanup_process_cause")
+	}
+}
+
 // cleanupProcess cleans up the FFmpeg process
 func (s *FFmpegStream) cleanupProcess() {
 	// Narrow critical section: grab and clear references under lock, then operate on locals
@@ -987,6 +1448,9 @@ func (s *FFmpegStream) cleanupProcess() {
 			"pid", pid,
 			"operation", "cleanup_process_start")
 	}
+
+	// Log context cancellation cause for diagnostics
+	s.logContextCause(pid)
 
 	// Close stdout
 	if stdout != nil {
@@ -1143,23 +1607,16 @@ func (s *FFmpegStream) handleRestartBackoff() {
 	currentRestartCount := s.restartCount
 
 	// Cap the exponent to prevent integer overflow
-	exponent := s.restartCount - 1
-	if exponent > maxBackoffExponent {
-		exponent = maxBackoffExponent
-	}
+	exponent := min(s.restartCount-1, maxBackoffExponent)
 
-	backoff := s.backoffDuration * time.Duration(1<<uint(exponent))
-	if backoff > s.maxBackoff {
-		backoff = s.maxBackoff
-	}
+	backoff := min(s.backoffDuration*time.Duration(1<<uint(exponent)), s.maxBackoff)
 
 	// Add rate limiting for very high restart counts to prevent runaway loops
 	if currentRestartCount > 50 {
 		// Additional delay proportional to restart count beyond 50
-		additionalDelay := time.Duration(currentRestartCount-50) * 10 * time.Second
-		if additionalDelay > 5*time.Minute {
-			additionalDelay = 5 * time.Minute // Cap at 5 minutes extra
-		}
+		additionalDelay := min(time.Duration(currentRestartCount-50)*10*time.Second,
+			// Cap at 5 minutes extra
+			5*time.Minute)
 		backoff += additionalDelay
 		streamLogger.Warn("high restart count detected - applying rate limiting",
 			"url", privacy.SanitizeRTSPUrl(s.source.SafeString),
@@ -1169,15 +1626,6 @@ func (s *FFmpegStream) handleRestartBackoff() {
 			"operation", "restart_rate_limit")
 	}
 	s.restartCountMu.Unlock()
-
-	if conf.Setting().Debug {
-		streamLogger.Debug("applying restart backoff",
-			"url", privacy.SanitizeRTSPUrl(s.source.SafeString),
-			"backoff_ms", backoff.Milliseconds(),
-			"jitter_percent_max", restartJitterPercentMax,
-			"restart_count", currentRestartCount,
-			"operation", "restart_backoff")
-	}
 
 	// Add jitter to avoid synchronized restarts across many streams (thundering herd)
 	wait := backoff
@@ -1192,6 +1640,19 @@ func (s *FFmpegStream) handleRestartBackoff() {
 		}
 	}
 
+	// STATE TRANSITION: * → backoff (entering backoff period before restart)
+	s.transitionState(StateBackoff, fmt.Sprintf("restart #%d: waiting %s (base backoff: %s)", currentRestartCount, FormatDuration(wait), FormatDuration(backoff)))
+
+	if conf.Setting().Debug {
+		streamLogger.Debug("applying restart backoff",
+			"url", privacy.SanitizeRTSPUrl(s.source.SafeString),
+			"backoff_ms", backoff.Milliseconds(),
+			"wait_ms", wait.Milliseconds(),
+			"jitter_percent_max", restartJitterPercentMax,
+			"restart_count", currentRestartCount,
+			"operation", "restart_backoff")
+	}
+
 	// Log with both formats for compatibility and support dumps
 	streamLogger.Info("waiting before restart attempt",
 		"url", privacy.SanitizeRTSPUrl(s.source.SafeString),
@@ -1201,7 +1662,7 @@ func (s *FFmpegStream) handleRestartBackoff() {
 		"restart_count", currentRestartCount,
 		"component", "ffmpeg-stream",
 		"operation", "restart_wait")
-	log.Printf("⏳ Waiting %v before restart attempt #%d for %s", wait, currentRestartCount, privacy.SanitizeRTSPUrl(s.source.SafeString))
+	log.Printf("⏳ Waiting %s before restart attempt #%d for %s", FormatDuration(wait), currentRestartCount, privacy.SanitizeRTSPUrl(s.source.SafeString))
 
 	select {
 	case <-time.After(wait):
@@ -1218,6 +1679,9 @@ func (s *FFmpegStream) handleRestartBackoff() {
 // This method is idempotent - multiple calls are safe and will not panic.
 func (s *FFmpegStream) Stop() {
 	s.stopOnce.Do(func() {
+		// STATE TRANSITION: * → stopped (Stop() called, permanently stopping stream)
+		s.transitionState(StateStopped, "Stop() called")
+
 		s.stoppedMu.Lock()
 		s.stopped = true
 		s.stoppedMu.Unlock()
@@ -1225,13 +1689,13 @@ func (s *FFmpegStream) Stop() {
 		// Signal stop
 		close(s.stopChan)
 
-		// Cancel context with proper locking
+		// Cancel context with reason using proper locking
 		s.cancelMu.RLock()
 		cancel := s.cancel
 		s.cancelMu.RUnlock()
 
 		if cancel != nil {
-			cancel()
+			cancel(fmt.Errorf("FFmpegStream: Stop() called for %s", privacy.SanitizeRTSPUrl(s.source.SafeString)))
 		}
 
 		// Cleanup process
@@ -1259,6 +1723,13 @@ func (s *FFmpegStream) Restart(manual bool) {
 	}
 	s.restartInProgress = true
 	s.restartMu.Unlock()
+
+	// STATE TRANSITION: * → restarting (Restart() called)
+	restartType := "automatic"
+	if manual {
+		restartType = "manual"
+	}
+	s.transitionState(StateRestarting, fmt.Sprintf("%s restart requested", restartType))
 
 	// Reset restart count only on manual restart
 	if manual {
@@ -1294,39 +1765,24 @@ func (s *FFmpegStream) Restart(manual bool) {
 }
 
 // IsRestarting checks if the stream is currently in the process of restarting.
-// This includes streams that are:
-// - Actively processing a restart request (restartInProgress flag set)
-// - In backoff period between restart attempts (no process running but not stopped)
-// - Waiting for circuit breaker cooldown
+// With the state machine, this is now simpler: check if state indicates restart-related activity.
+// This includes streams in: StateRestarting, StateBackoff, StateCircuitOpen, or StateStarting.
 //
 // This method helps prevent the manager from interfering with streams that are
 // already handling their own restart cycle, avoiding premature restarts that
 // would break the exponential backoff mechanism.
 func (s *FFmpegStream) IsRestarting() bool {
-	// Check if we have a running process
-	// A process is only running if cmd exists, has a Process, and hasn't exited (no ProcessState)
-	s.cmdMu.Lock()
-	isRunning := s.cmd != nil && s.cmd.Process != nil && s.cmd.ProcessState == nil
-	s.cmdMu.Unlock()
-	
-	// Check if restart is in progress
-	s.restartMu.Lock()
-	inProgress := s.restartInProgress
-	s.restartMu.Unlock()
-	
-	// Check if stream is stopped
-	s.stoppedMu.RLock()
-	stopped := s.stopped
-	s.stoppedMu.RUnlock()
-	
-	// Check if circuit breaker is open (in cooldown) - silent check to avoid log spam
-	circuitOpen := s.isCircuitOpenSilent()
-	
-	// Stream is restarting if:
-	// 1. Restart is explicitly in progress
-	// 2. No process running and not stopped (in backoff)
-	// 3. Circuit breaker is open (waiting for cooldown)
-	return inProgress || (!isRunning && !stopped) || circuitOpen
+	state := s.GetProcessState()
+
+	// Stream is restarting if in any of these states:
+	// - StateRestarting: explicit restart requested
+	// - StateBackoff: waiting before retry
+	// - StateCircuitOpen: circuit breaker cooldown
+	// - StateStarting: in process of starting (transitional state)
+	return state == StateRestarting ||
+		state == StateBackoff ||
+		state == StateCircuitOpen ||
+		state == StateStarting
 }
 
 // GetProcessStartTime returns the start time of the current FFmpeg process.
@@ -1336,7 +1792,7 @@ func (s *FFmpegStream) IsRestarting() bool {
 func (s *FFmpegStream) GetProcessStartTime() time.Time {
 	s.cmdMu.Lock()
 	defer s.cmdMu.Unlock()
-	
+
 	// Only return start time if we have a truly running process (not exited)
 	// Check ProcessState to ensure the process hasn't exited
 	if s.cmd != nil && s.cmd.Process != nil && s.cmd.ProcessState == nil {
@@ -1393,17 +1849,29 @@ func (s *FFmpegStream) GetHealth() StreamHealth {
 			isReceivingData = false
 
 			if conf.Setting().Debug {
-				streamLogger.Debug("stream in grace period",
+				streamLogger.Debug("stream in grace period, no data received yet",
 					"url", privacy.SanitizeRTSPUrl(s.source.SafeString),
 					"time_since_creation_seconds", timeSinceCreation.Seconds(),
 					"grace_period_seconds", gracePeriod.Seconds(),
 					"remaining_grace_seconds", (gracePeriod - timeSinceCreation).Seconds(),
-					"component", "ffmpeg-stream")
+					"last_data", "never",
+					"component", "ffmpeg-stream",
+					"operation", "get_health")
 			}
 		} else {
 			// Grace period expired and still no data - definitely not healthy
 			isHealthy = false
 			isReceivingData = false
+
+			if conf.Setting().Debug {
+				streamLogger.Debug("stream has never received data (grace period expired)",
+					"url", privacy.SanitizeRTSPUrl(s.source.SafeString),
+					"time_since_creation_seconds", timeSinceCreation.Seconds(),
+					"grace_period_seconds", gracePeriod.Seconds(),
+					"last_data", "never",
+					"component", "ffmpeg-stream",
+					"operation", "get_health")
+			}
 		}
 	} else {
 		// Consider unhealthy if no data for configured threshold
@@ -1411,6 +1879,33 @@ func (s *FFmpegStream) GetHealth() StreamHealth {
 		// Stream is receiving data if we got data within the threshold
 		isReceivingData = time.Since(lastData) < defaultReceivingDataThreshold
 	}
+
+	// Get current process state
+	state := s.GetProcessState()
+
+	// Get state history (last 10 transitions for health reporting)
+	allHistory := s.GetStateHistory()
+	var recentHistory []StateTransition
+	if len(allHistory) > 10 {
+		recentHistory = allHistory[len(allHistory)-10:]
+	} else {
+		recentHistory = allHistory
+	}
+
+	// Get error history (last 10 errors for diagnostics)
+	// Note: We store up to maxErrorHistorySize (100) internally for comprehensive analysis,
+	// but only expose the most recent maxErrorHistoryExposed (10) via the health API
+	// to keep API responses manageable while maintaining full history for debugging
+	allErrors := s.getErrorContexts()
+	var recentErrors []*ErrorContext
+	if len(allErrors) > maxErrorHistoryExposed {
+		recentErrors = allErrors[len(allErrors)-maxErrorHistoryExposed:]
+	} else {
+		recentErrors = allErrors
+	}
+
+	// Get last error context
+	lastError := s.getLastErrorContext()
 
 	// Debug log health check details
 	if conf.Setting().Debug {
@@ -1425,6 +1920,14 @@ func (s *FFmpegStream) GetHealth() StreamHealth {
 			"bytes_per_second", dataRate,
 			"restart_count", restarts,
 			"has_process", currentPID > 0,
+			"process_state", state.String(),
+			"error_count", len(allErrors),
+			"last_error_type", func() string {
+				if lastError != nil {
+					return lastError.ErrorType
+				}
+				return "none"
+			}(),
 			"operation", "get_health")
 	}
 
@@ -1435,6 +1938,10 @@ func (s *FFmpegStream) GetHealth() StreamHealth {
 		TotalBytesReceived: totalBytes,
 		BytesPerSecond:     dataRate,
 		IsReceivingData:    isReceivingData,
+		ProcessState:       state,
+		StateHistory:       recentHistory,
+		LastErrorContext:   lastError,
+		ErrorHistory:       recentErrors,
 	}
 }
 
@@ -1443,6 +1950,19 @@ func (s *FFmpegStream) updateLastDataTime() {
 	s.lastDataMu.Lock()
 	s.lastDataTime = time.Now()
 	s.lastDataMu.Unlock()
+}
+
+// resetDataTracking resets all data tracking state for a new process.
+// This prevents confusing "inactive for 0 seconds" logs and ensures
+// clean state for each new FFmpeg process instance.
+func (s *FFmpegStream) resetDataTracking() {
+	s.lastDataMu.Lock()
+	s.lastDataTime = time.Time{} // Explicitly reset to zero time
+	s.lastDataMu.Unlock()
+
+	s.bytesReceivedMu.Lock()
+	s.totalBytesReceived = 0
+	s.bytesReceivedMu.Unlock()
 }
 
 // logStreamHealth logs the current stream health status
@@ -1488,7 +2008,7 @@ func (s *FFmpegStream) logStreamHealth() {
 func (s *FFmpegStream) isCircuitOpenSilent() bool {
 	s.circuitMu.Lock()
 	defer s.circuitMu.Unlock()
-	
+
 	// Check if circuit was opened and we're still in cooldown
 	return !s.circuitOpenTime.IsZero() && time.Since(s.circuitOpenTime) < circuitBreakerCooldown
 }
@@ -1498,16 +2018,16 @@ func (s *FFmpegStream) isCircuitOpenSilent() bool {
 func (s *FFmpegStream) circuitCooldownRemaining() (time.Duration, bool) {
 	s.circuitMu.Lock()
 	defer s.circuitMu.Unlock()
-	
+
 	if s.circuitOpenTime.IsZero() {
 		return 0, false
 	}
-	
+
 	elapsed := time.Since(s.circuitOpenTime)
 	if elapsed >= circuitBreakerCooldown {
 		return 0, false
 	}
-	
+
 	return circuitBreakerCooldown - elapsed, true
 }
 
@@ -1521,8 +2041,8 @@ func (s *FFmpegStream) isCircuitOpen() bool {
 		streamLogger.Warn("circuit breaker is open",
 			"url", privacy.SanitizeRTSPUrl(s.source.SafeString),
 			"consecutive_failures", s.consecutiveFailures,
-			"cooldown_remaining", remaining.Round(time.Second).String(),
-			"cooldown_total", circuitBreakerCooldown.String(),
+			"cooldown_remaining", FormatDuration(remaining),
+			"cooldown_total", FormatDuration(circuitBreakerCooldown),
 			"component", "ffmpeg-stream")
 		return true
 	}
@@ -1538,8 +2058,8 @@ func (s *FFmpegStream) isCircuitOpen() bool {
 		streamLogger.Info("circuit breaker closed after cooldown",
 			"url", privacy.SanitizeRTSPUrl(s.source.SafeString),
 			"previous_failures", previousFailures,
-			"open_duration", openDuration.Round(time.Second).String(),
-			"cooldown_period", circuitBreakerCooldown.String(),
+			"open_duration", FormatDuration(openDuration),
+			"cooldown_period", FormatDuration(circuitBreakerCooldown),
 			"component", "ffmpeg-stream")
 
 		// Report circuit breaker closure to telemetry
@@ -1559,8 +2079,8 @@ func (s *FFmpegStream) isCircuitOpen() bool {
 			streamLogger.Debug("circuit breaker closed after cooldown",
 				"url", privacy.SanitizeRTSPUrl(s.source.SafeString),
 				"previous_failures", previousFailures,
-				"open_duration", openDuration.Round(time.Second).String(),
-				"cooldown_period", circuitBreakerCooldown.String())
+				"open_duration", FormatDuration(openDuration),
+				"cooldown_period", FormatDuration(circuitBreakerCooldown))
 		}
 		_ = errorWithContext // Keep for telemetry reporting when enabled
 	}
@@ -1635,16 +2155,26 @@ func (s *FFmpegStream) recordFailure(runtime time.Duration) {
 	}
 
 	if shouldOpenCircuit {
+		currentFailures := s.consecutiveFailures
 		s.circuitOpenTime = time.Now()
+		// Unlock circuit mutex before calling transitionState to avoid nested lock acquisition
+		s.circuitMu.Unlock()
+
+		// STATE TRANSITION: * → circuit_open (circuit breaker opened due to failures)
+		s.transitionState(StateCircuitOpen, fmt.Sprintf("circuit breaker opened: %s (failures: %d, runtime: %s)", reason, currentFailures, FormatDuration(runtime)))
+
+		// Re-lock for remaining operations
+		s.circuitMu.Lock()
+
 		streamLogger.Error("circuit breaker opened",
 			"url", privacy.SanitizeRTSPUrl(s.source.SafeString),
-			"consecutive_failures", s.consecutiveFailures,
-			"runtime", runtime.Round(time.Millisecond).String(),
+			"consecutive_failures", currentFailures,
+			"runtime", FormatDuration(runtime),
 			"reason", reason,
-			"cooldown_period", circuitBreakerCooldown.String(),
+			"cooldown_period", FormatDuration(circuitBreakerCooldown),
 			"component", "ffmpeg-stream")
 		log.Printf("🔒 Circuit breaker opened for %s after %d consecutive failures (%s, runtime: %s, cooldown: %s)",
-			privacy.SanitizeRTSPUrl(s.source.SafeString), s.consecutiveFailures, reason, runtime.Round(time.Millisecond), circuitBreakerCooldown)
+			privacy.SanitizeRTSPUrl(s.source.SafeString), currentFailures, reason, FormatDuration(runtime), FormatDuration(circuitBreakerCooldown))
 
 		// Report to Sentry with enhanced context
 		errorWithContext := errors.Newf("RTSP stream circuit breaker opened: %s (runtime: %v)", reason, runtime).
@@ -1653,7 +2183,7 @@ func (s *FFmpegStream) recordFailure(runtime time.Duration) {
 			Context("operation", "circuit_breaker_open").
 			Context("url", privacy.SanitizeRTSPUrl(s.source.SafeString)).
 			Context("transport", s.transport).
-			Context("consecutive_failures", s.consecutiveFailures).
+			Context("consecutive_failures", currentFailures).
 			Context("runtime_seconds", runtime.Seconds()).
 			Context("reason", reason).
 			Context("cooldown_seconds", circuitBreakerCooldown.Seconds()).
@@ -1713,6 +2243,84 @@ func (s *FFmpegStream) validateUserTimeout(timeoutStr string) error {
 	}
 
 	return nil
+}
+
+// recordErrorContext stores an error context in the history buffer.
+// It maintains a ring buffer of the last N errors for diagnostics.
+func (s *FFmpegStream) recordErrorContext(ctx *ErrorContext) {
+	if ctx == nil {
+		return
+	}
+
+	s.errorContextsMu.Lock()
+	defer s.errorContextsMu.Unlock()
+
+	// Add to history
+	s.errorContexts = append(s.errorContexts, ctx)
+
+	// Maintain ring buffer size
+	if len(s.errorContexts) > s.maxErrorHistory {
+		// Remove oldest entry
+		s.errorContexts = s.errorContexts[1:]
+	}
+
+	// Log the error context for visibility
+	// SECURITY: Defensive sanitization - strip any @ prefix from target_host
+	// in case extraction logic failed to properly sanitize credentials
+	targetHost := ctx.TargetHost
+	if strings.Contains(targetHost, "@") {
+		// If @ is present, take everything after the last @
+		if idx := strings.LastIndex(targetHost, "@"); idx != -1 {
+			targetHost = targetHost[idx+1:]
+		}
+	}
+
+	streamLogger.Error("FFmpeg error detected",
+		"url", privacy.SanitizeRTSPUrl(s.source.SafeString),
+		"error_type", ctx.ErrorType,
+		"primary_message", ctx.PrimaryMessage,
+		"target_host", targetHost, // Use defensively sanitized host
+		"target_port", ctx.TargetPort,
+		"should_open_circuit", ctx.ShouldOpenCircuit(),
+		"should_restart", ctx.ShouldRestart(),
+		"component", "ffmpeg-stream",
+		"operation", "error_detection")
+}
+
+// getErrorContexts returns a copy of the error history for diagnostics.
+// This is thread-safe and can be called from any goroutine.
+func (s *FFmpegStream) getErrorContexts() []*ErrorContext {
+	s.errorContextsMu.RLock()
+	defer s.errorContextsMu.RUnlock()
+
+	// Return a copy to avoid race conditions
+	result := make([]*ErrorContext, len(s.errorContexts))
+	copy(result, s.errorContexts)
+	return result
+}
+
+// getLastErrorContext returns the most recent error context, or nil if no errors.
+func (s *FFmpegStream) getLastErrorContext() *ErrorContext {
+	s.errorContextsMu.RLock()
+	defer s.errorContextsMu.RUnlock()
+
+	if len(s.errorContexts) == 0 {
+		return nil
+	}
+	return s.errorContexts[len(s.errorContexts)-1]
+}
+
+// checkEarlyErrors checks FFmpeg stderr for errors during the early detection window.
+// This is called periodically during the first 5 seconds after process start.
+// Returns the error context if an error is detected, nil otherwise.
+func (s *FFmpegStream) checkEarlyErrors() *ErrorContext {
+	// Read stderr output safely
+	s.stderrMu.RLock()
+	stderrOutput := s.stderr.String()
+	s.stderrMu.RUnlock()
+
+	// Extract error context if present
+	return ExtractErrorContext(stderrOutput)
 }
 
 // conditionalFailureReset resets failures only after the process has proven

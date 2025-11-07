@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -74,6 +75,7 @@ type RetentionSettings struct {
 	MaxUsage         string `json:"maxUsage"`         // maximum disk usage percentage before cleanup
 	MinClips         int    `json:"minClips"`         // minimum number of clips per species to keep
 	KeepSpectrograms bool   `json:"keepSpectrograms"` // true to keep spectrograms
+	CheckInterval    int    `json:"checkInterval"`    // cleanup check interval in minutes (default: 15)
 }
 
 // AudioSettings contains settings for audio processing and export.
@@ -88,6 +90,9 @@ type SoundLevelSettings struct {
 type AudioSettings struct {
 	Source          string             `yaml:"source" mapstructure:"source" json:"source"`                   // audio source to use for analysis
 	FfmpegPath      string             `yaml:"ffmpegpath" mapstructure:"ffmpegpath" json:"ffmpegPath"`       // path to ffmpeg, runtime value
+	FfmpegVersion   string             `yaml:"-" json:"ffmpegVersion,omitempty"`                             // ffmpeg version string, runtime value
+	FfmpegMajor     int                `yaml:"-" json:"ffmpegMajor,omitempty"`                               // ffmpeg major version number, runtime value
+	FfmpegMinor     int                `yaml:"-" json:"ffmpegMinor,omitempty"`                               // ffmpeg minor version number, runtime value
 	SoxPath         string             `yaml:"soxpath" mapstructure:"soxpath" json:"soxPath"`                // path to sox, runtime value
 	SoxAudioTypes   []string           `yaml:"-" json:"-"`                                                   // supported audio types of sox, runtime value
 	StreamTransport string             `json:"streamTransport"`                                              // preferred transport for audio streaming: "auto", "sse", or "ws"
@@ -97,6 +102,21 @@ type AudioSettings struct {
 
 	Equalizer EqualizerSettings `json:"equalizer"` // equalizer settings
 }
+
+// NeedsFfprobeWorkaround returns true if the current FFmpeg version requires
+// using ffprobe to get audio file length for spectrograms (FFmpeg 5.x bug).
+// FFmpeg 7.x and later have this issue fixed.
+func (a *AudioSettings) NeedsFfprobeWorkaround() bool {
+	// FFmpeg 5.x has a bug that requires using ffprobe for audio duration
+	// FFmpeg 7.x and later have this fixed
+	return a.FfmpegMajor == 5
+}
+
+// HasFfmpegVersion returns true if FFmpeg version information has been detected and populated.
+func (a *AudioSettings) HasFfmpegVersion() bool {
+	return a.FfmpegVersion != "" && a.FfmpegMajor > 0
+}
+
 type Thumbnails struct {
 	Debug          bool   `json:"debug"`          // true to enable debug mode
 	Summary        bool   `json:"summary"`        // show thumbnails on summary table
@@ -107,11 +127,74 @@ type Thumbnails struct {
 
 // Dashboard contains settings for the web dashboard.
 type Dashboard struct {
-	Thumbnails   Thumbnails `json:"thumbnails"`       // thumbnails settings
-	SummaryLimit int        `json:"summaryLimit"`     // limit for the number of species shown in the summary table
-	Locale       string     `json:"locale,omitempty"` // UI locale setting
-	NewUI        bool       `json:"newUI"`            // Enable redirect from old HTMX UI to new Svelte UI
+	Thumbnails   Thumbnails           `json:"thumbnails"`       // thumbnails settings
+	SummaryLimit int                  `json:"summaryLimit"`     // limit for the number of species shown in the summary table
+	Locale       string               `json:"locale,omitempty"` // UI locale setting
+	NewUI        bool                 `json:"newUI"`            // Enable redirect from old HTMX UI to new Svelte UI
+	Spectrogram  SpectrogramPreRender `json:"spectrogram"`      // Spectrogram pre-rendering settings
 }
+
+// Spectrogram generation mode constants
+const (
+	SpectrogramModeAuto          = "auto"
+	SpectrogramModePreRender     = "prerender"
+	SpectrogramModeUserRequested = "user-requested"
+)
+
+// SpectrogramPreRender contains settings for spectrogram generation modes.
+// Three modes control when and how spectrograms are generated:
+//   - "auto": Generate on-demand when API is called (default, suitable for most systems)
+//   - "prerender": Background worker generates during audio clip save (continuous CPU usage)
+//   - "user-requested": Only generate when user clicks button in UI (zero automatic overhead)
+type SpectrogramPreRender struct {
+	Mode    string `json:"mode"    mapstructure:"mode"`    // Generation mode: "auto" (default), "prerender", "user-requested"
+	Enabled bool   `json:"enabled" mapstructure:"enabled"` // DEPRECATED: Use Mode instead. Kept for backward compatibility (true = "prerender", false = "auto")
+	Size    string `json:"size"    mapstructure:"size"`    // Default size for all modes (see recommendations below)
+	Raw     bool   `json:"raw"     mapstructure:"raw"`     // Generate raw spectrogram without axes/legend (default: true)
+}
+
+// GetMode returns the effective spectrogram generation mode, handling backward compatibility.
+// If Mode is explicitly set, it is used. Otherwise, it derives the mode from the deprecated
+// Enabled field: true = "prerender", false = "auto".
+func (s *SpectrogramPreRender) GetMode() string {
+	// If Mode is explicitly set to a valid value, use it
+	if s.Mode == SpectrogramModeAuto || s.Mode == SpectrogramModePreRender || s.Mode == SpectrogramModeUserRequested {
+		return s.Mode
+	}
+
+	// Backward compatibility: derive from Enabled field
+	if s.Enabled {
+		return SpectrogramModePreRender
+	}
+
+	// Default to "auto" mode
+	return SpectrogramModeAuto
+}
+
+// IsPreRenderEnabled returns true if spectrograms should be pre-rendered in background.
+func (s *SpectrogramPreRender) IsPreRenderEnabled() bool {
+	return s.GetMode() == "prerender"
+}
+
+// IsAutoMode returns true if spectrograms should be generated on-demand via API.
+func (s *SpectrogramPreRender) IsAutoMode() bool {
+	return s.GetMode() == "auto"
+}
+
+// IsUserRequestedMode returns true if spectrograms should only be generated on explicit user request.
+func (s *SpectrogramPreRender) IsUserRequestedMode() bool {
+	return s.GetMode() == "user-requested"
+}
+
+// Size recommendations for SpectrogramPreRender.Size:
+//
+//	"sm" (400px)  - Recommended. Used by recent detections card and detections list view
+//	"md" (800px)  - Not currently used by web UI
+//	"lg" (1000px) - Used by detailed detection view in web UI
+//	"xl" (1200px) - Not currently used by web UI
+//
+// Choose "sm" for optimal performance - it covers the most common UI views and minimizes
+// storage and processing overhead. Only use "lg" if detailed view performance is critical.
 
 // DynamicThresholdSettings contains settings for dynamic threshold adjustment.
 type DynamicThresholdSettings struct {
@@ -156,6 +239,121 @@ type WeatherSettings struct {
 	Debug        bool                 `json:"debug"`        // true to enable debug mode
 	OpenWeather  OpenWeatherSettings  `json:"openWeather"`  // OpenWeather integration settings
 	Wunderground WundergroundSettings `json:"wunderground"` // WeatherUnderground integration settings
+}
+
+// ---------------- Notification push configuration -----------------
+
+// NotificationConfig is the root for notification-specific settings.
+type NotificationConfig struct {
+	Push      PushSettings          `json:"push" yaml:"push"`
+	Templates NotificationTemplates `json:"templates" yaml:"templates"`
+}
+
+// NotificationTemplates contains customizable notification message templates.
+type NotificationTemplates struct {
+	NewSpecies NewSpeciesTemplate `json:"newSpecies" yaml:"newspecies"`
+}
+
+// NewSpeciesTemplate contains templates for new species detection notifications.
+type NewSpeciesTemplate struct {
+	Title   string `json:"title" yaml:"title"`
+	Message string `json:"message" yaml:"message"`
+}
+
+// PushSettings controls global push delivery and provider list.
+type PushSettings struct {
+	Enabled        bool                 `json:"enabled"`
+	DefaultTimeout time.Duration        `json:"default_timeout" mapstructure:"default_timeout"`
+	MaxRetries     int                  `json:"max_retries" mapstructure:"max_retries"`
+	RetryDelay     time.Duration        `json:"retry_delay" mapstructure:"retry_delay"`
+	CircuitBreaker CircuitBreakerConfig `json:"circuit_breaker" mapstructure:"circuit_breaker"`
+	HealthCheck    HealthCheckConfig    `json:"health_check" mapstructure:"health_check"`
+	RateLimiting   RateLimitingConfig   `json:"rate_limiting" mapstructure:"rate_limiting"`
+	Providers      []PushProviderConfig `json:"providers"`
+}
+
+// CircuitBreakerConfig holds circuit breaker configuration.
+type CircuitBreakerConfig struct {
+	Enabled             bool          `json:"enabled"`
+	MaxFailures         int           `json:"max_failures" mapstructure:"max_failures"`
+	Timeout             time.Duration `json:"timeout"`
+	HalfOpenMaxRequests int           `json:"half_open_max_requests" mapstructure:"half_open_max_requests"`
+}
+
+// HealthCheckConfig holds health check configuration.
+type HealthCheckConfig struct {
+	Enabled  bool          `json:"enabled"`
+	Interval time.Duration `json:"interval"`
+	Timeout  time.Duration `json:"timeout"`
+}
+
+// RateLimitingConfig holds rate limiting configuration.
+type RateLimitingConfig struct {
+	Enabled            bool `json:"enabled"`
+	RequestsPerMinute  int  `json:"requests_per_minute" mapstructure:"requests_per_minute"`
+	BurstSize          int  `json:"burst_size" mapstructure:"burst_size"`
+}
+
+// PushProviderConfig configures a single push provider instance.
+type PushProviderConfig struct {
+	Type    string           `json:"type"`
+	Enabled bool             `json:"enabled"`
+	Name    string           `json:"name"`
+	Filter  PushFilterConfig `json:"filter"`
+	// Shoutrrr-specific
+	URLs    []string      `json:"urls"`
+	Timeout time.Duration `json:"timeout"`
+	// Script-specific
+	Command     string            `json:"command"`
+	Args        []string          `json:"args"`
+	Environment map[string]string `json:"environment"`
+	InputFormat string            `json:"input_format" mapstructure:"input_format"`
+	// Webhook-specific
+	Endpoints []WebhookEndpointConfig `json:"endpoints"`
+	Template  string                  `json:"template"` // Custom JSON template
+}
+
+// WebhookEndpointConfig configures a single webhook endpoint.
+type WebhookEndpointConfig struct {
+	URL     string                 `json:"url"`
+	Method  string                 `json:"method"`  // POST, PUT, PATCH (default: POST)
+	Headers map[string]string      `json:"headers"` // Custom HTTP headers
+	Timeout time.Duration          `json:"timeout"` // Per-endpoint timeout (default: use provider timeout)
+	Auth    WebhookAuthConfig      `json:"auth"`    // Authentication configuration
+}
+
+// WebhookAuthConfig configures authentication for webhook requests.
+// Supports multiple secret sources for security and flexibility:
+//   - Direct values: token: "literal-value" (for development)
+//   - Environment variables: token: "${TOKEN}" (recommended for Docker)
+//   - File references: token_file: "/run/secrets/token" (for Kubernetes/Swarm)
+//
+// File fields take precedence over value fields when both are set.
+type WebhookAuthConfig struct {
+	Type   string `json:"type"`   // "none", "bearer", "basic", "custom"
+
+	// Bearer authentication
+	Token     string `json:"token"`      // Token value or ${ENV_VAR}
+	TokenFile string `json:"token_file"` // Path to file containing token
+
+	// Basic authentication
+	User     string `json:"user"`      // Username value or ${ENV_VAR}
+	UserFile string `json:"user_file"` // Path to file containing username
+	Pass     string `json:"pass"`      // Password value or ${ENV_VAR}
+	PassFile string `json:"pass_file"` // Path to file containing password
+
+	// Custom header authentication
+	Header     string `json:"header"`       // Header name
+	Value      string `json:"value"`        // Header value or ${ENV_VAR}
+	ValueFile  string `json:"value_file"`   // Path to file containing header value
+}
+
+// PushFilterConfig limits which notifications a provider receives.
+type PushFilterConfig struct {
+	Types           []string       `json:"types" mapstructure:"types"`
+	Priorities      []string       `json:"priorities" mapstructure:"priorities"`
+	Components      []string       `json:"components" mapstructure:"components"`
+	MetadataFilters map[string]any `json:"metadata_filters" mapstructure:"metadata_filters"`
 }
 
 // WundergroundSettings contains settings for WeatherUnderground integration.
@@ -265,14 +463,31 @@ type SentrySettings struct {
 	Debug   bool `json:"debug"`   // true to enable transparent telemetry logging
 }
 
+// FalsePositiveFilterSettings contains settings for false positive filtering aggressivity levels.
+// The filtering system requires multiple confirmations of a detection within overlapping analyses
+// to filter out false positives (wind, cars, etc.). Higher levels require more confirmations
+// but need faster hardware and higher overlap settings.
+type FalsePositiveFilterSettings struct {
+	Level int `json:"level"` // Filtering aggressivity level (0-5): 0=Off, 1=Lenient, 2=Moderate, 3=Balanced, 4=Strict, 5=Maximum
+}
+
+// Validate checks if the filter level is within the valid range (0-5).
+func (f *FalsePositiveFilterSettings) Validate() error {
+	if f.Level < 0 || f.Level > 5 {
+		return fmt.Errorf("invalid false positive filter level %d: must be 0-5 (0=Off, 1=Lenient, 2=Moderate, 3=Balanced, 4=Strict, 5=Maximum)", f.Level)
+	}
+	return nil
+}
+
 // RealtimeSettings contains all settings related to realtime processing.
 type RealtimeSettings struct {
-	Interval         int                      `json:"interval"`         // minimum interval between log messages in seconds
-	ProcessingTime   bool                     `json:"processingTime"`   // true to report processing time for each prediction
-	Audio            AudioSettings            `json:"audio"`            // Audio processing settings
-	Dashboard        Dashboard                `json:"dashboard"`        // Dashboard settings
-	DynamicThreshold DynamicThresholdSettings `json:"dynamicThreshold"` // Dynamic threshold settings
-	Log              struct {
+	Interval            int                          `json:"interval"`            // minimum interval between log messages in seconds
+	ProcessingTime      bool                         `json:"processingTime"`      // true to report processing time for each prediction
+	Audio               AudioSettings                `json:"audio"`               // Audio processing settings
+	Dashboard           Dashboard                    `json:"dashboard"`           // Dashboard settings
+	DynamicThreshold    DynamicThresholdSettings     `json:"dynamicThreshold"`    // Dynamic threshold settings
+	FalsePositiveFilter FalsePositiveFilterSettings  `json:"falsePositiveFilter"` // False positive filtering aggressivity settings
+	Log                 struct {
 		Enabled bool   `json:"enabled"` // true to enable OBS chat log
 		Path    string `json:"path"`    // path to OBS chat log
 	} `json:"log"`
@@ -499,10 +714,10 @@ func (s *SeasonalTrackingSettings) Validate() error {
 		// Check that we have a complete set of seasons (either traditional or equatorial)
 		traditionalSeasons := []string{"spring", "summer", "fall", "winter"}
 		equatorialSeasons := []string{"wet1", "dry1", "wet2", "dry2"}
-		
+
 		hasAllTraditional := true
 		hasAllEquatorial := true
-		
+
 		// Check for traditional seasons
 		for _, required := range traditionalSeasons {
 			if _, exists := s.Seasons[required]; !exists {
@@ -510,7 +725,7 @@ func (s *SeasonalTrackingSettings) Validate() error {
 				break
 			}
 		}
-		
+
 		// Check for equatorial seasons
 		for _, required := range equatorialSeasons {
 			if _, exists := s.Seasons[required]; !exists {
@@ -518,7 +733,7 @@ func (s *SeasonalTrackingSettings) Validate() error {
 				break
 			}
 		}
-		
+
 		// Must have either all traditional or all equatorial seasons
 		if !hasAllTraditional && !hasAllEquatorial {
 			// Check if we at least have minimum number of seasons
@@ -588,17 +803,17 @@ type BirdNETConfig struct {
 	Threads     int                 `json:"threads"`     // number of CPU threads to use for analysis
 	Locale      string              `json:"locale"`      // language to use for labels
 	RangeFilter RangeFilterSettings `json:"rangeFilter"` // range filter settings
-	ModelPath   string              `json:"modelPath"`   // path to external model file (empty for embedded)
-	LabelPath   string              `json:"labelPath"`   // path to external label file (empty for embedded)
+	ModelPath   string              `json:"modelPath,omitempty" yaml:"modelPath,omitempty"`   // path to external model file (empty for embedded)
+	LabelPath   string              `json:"labelPath,omitempty" yaml:"labelPath,omitempty"`   // path to external label file (empty for embedded)
 	Labels      []string            `yaml:"-" json:"-"`  // list of available species labels, runtime value
 	UseXNNPACK  bool                `json:"useXnnpack"`  // true to use XNNPACK delegate for inference acceleration
 }
 
 // RangeFilterSettings contains settings for the range filter
 type RangeFilterSettings struct {
-	Debug       bool      `json:"debug"`                          // true to enable debug mode
-	Model       string    `json:"model"`                          // range filter model version: "legacy" for v1, or empty/default for v2
-	ModelPath   string    `json:"modelPath"`                      // path to external meta model file (empty for embedded)
+	Debug       bool      `json:"debug"`                      // true to enable debug mode
+	Model       string    `json:"model"`                      // range filter model version: "legacy" for v1, or empty/default for v2
+	ModelPath   string    `json:"modelPath"`                  // path to external meta model file (empty for embedded)
 	Threshold   float32   `json:"threshold"`                  // rangefilter species occurrence threshold
 	Species     []string  `yaml:"-" json:"species,omitempty"` // list of included species, runtime value
 	LastUpdated time.Time `yaml:"-" json:"lastUpdated"`       // last time the species list was updated, runtime value
@@ -634,9 +849,20 @@ type AllowSubnetBypass struct {
 type Security struct {
 	Debug bool `json:"debug"` // true to enable debug mode
 
-	// Host is the primary hostname used for TLS certificates
-	// and OAuth redirect URLs. Required when using AutoTLS or
-	// authentication providers. Used to form the redirect URIs.
+	// BaseURL is the complete external URL for this instance, including
+	// scheme, host, and optional port (e.g., "https://birdnet.example.com:5500").
+	// Used for generating OAuth redirect URLs and notification links.
+	// Takes precedence over Host when set.
+	// Can be overridden with BIRDNET_URL environment variable.
+	// NOTE: This field is prepared for future implementation (issue #1462)
+	BaseURL string `json:"baseUrl"`
+
+	// Host is the primary hostname used for TLS certificates,
+	// OAuth redirect URLs, and notification link generation.
+	// Required when using AutoTLS or authentication providers.
+	// Also used to generate URLs in push notifications - set this
+	// to your public hostname when using a reverse proxy.
+	// Can be overridden with BIRDNET_HOST environment variable.
 	Host string `json:"host"`
 
 	// AutoTLS enables automatic TLS certificate management using
@@ -879,6 +1105,8 @@ type Settings struct {
 	} `json:"output"`
 
 	Backup BackupConfig `json:"backup"` // Backup configuration
+
+	Notification NotificationConfig `json:"notification"` // Configuration for push notifications
 }
 
 // LogConfig defines the configuration for a log file
@@ -1120,6 +1348,31 @@ func GetSettings() *Settings {
 	return settingsInstance
 }
 
+// prepareSettingsForSave applies data transformations to settings before saving.
+// This function is separated from SaveSettings to enable unit testing without filesystem I/O.
+//
+// Current transformations:
+//   - Auto-populates seasonal tracking seasons based on latitude if not already set
+//
+// Note: This is a pure function that only transforms data. It does not handle:
+//   - Mutex locking (handled by SaveSettings caller)
+//   - File I/O operations (handled by SaveSettings)
+//   - Species list synchronization (handled separately in SaveSettings)
+func prepareSettingsForSave(s *Settings, latitude float64) Settings {
+	settingsCopy := *s
+
+	// Auto-update seasonal tracking dates based on latitude if seasonal tracking is enabled
+	// and no custom seasons are already defined
+	if settingsCopy.Realtime.SpeciesTracking.SeasonalTracking.Enabled &&
+		len(settingsCopy.Realtime.SpeciesTracking.SeasonalTracking.Seasons) == 0 {
+		// Get hemisphere-appropriate default seasons
+		defaultSeasons := GetDefaultSeasons(latitude)
+		settingsCopy.Realtime.SpeciesTracking.SeasonalTracking.Seasons = defaultSeasons
+	}
+
+	return settingsCopy
+}
+
 // SaveSettings saves the current settings to the configuration file.
 // It uses UpdateYAMLConfig to handle the atomic write process.
 func SaveSettings() error {
@@ -1129,20 +1382,14 @@ func SaveSettings() error {
 	// Create a deep copy of the settings
 	settingsCopy := *settingsInstance
 
-	// Create a separate copy of the species list
+	// Create a separate copy of the species list with proper locking
+	// Note: This MUST stay here to maintain correct mutex semantics
 	speciesListMutex.RLock()
-	settingsCopy.BirdNET.RangeFilter.Species = make([]string, len(settingsInstance.BirdNET.RangeFilter.Species))
-	copy(settingsCopy.BirdNET.RangeFilter.Species, settingsInstance.BirdNET.RangeFilter.Species)
+	settingsCopy.BirdNET.RangeFilter.Species = slices.Clone(settingsInstance.BirdNET.RangeFilter.Species)
 	speciesListMutex.RUnlock()
 
-	// Auto-update seasonal tracking dates based on latitude if seasonal tracking is enabled
-	// and no custom seasons are already defined
-	if settingsCopy.Realtime.SpeciesTracking.SeasonalTracking.Enabled &&
-		len(settingsCopy.Realtime.SpeciesTracking.SeasonalTracking.Seasons) == 0 {
-		// Get hemisphere-appropriate default seasons
-		defaultSeasons := GetDefaultSeasons(settingsCopy.BirdNET.Latitude)
-		settingsCopy.Realtime.SpeciesTracking.SeasonalTracking.Seasons = defaultSeasons
-	}
+	// Apply data transformations (seasonal tracking, etc.)
+	settingsCopy = prepareSettingsForSave(&settingsCopy, settingsInstance.BirdNET.Latitude)
 
 	// Find the path of the current config file
 	configPath, err := FindConfigFile()
@@ -1231,6 +1478,99 @@ func GetTestSettings() *Settings {
 	settings.Output.SQLite.Path = ":memory:"
 
 	return settings
+}
+
+// SettingsBuilder provides a fluent interface for constructing test settings.
+// It simplifies test setup by providing convenient methods for common configuration patterns.
+//
+// Example usage:
+//
+//	settings := conf.NewTestSettings().
+//	    WithBirdNET(0.9, 45.0, -122.0).
+//	    WithMQTT("tcp://localhost:1883", "test").
+//	    Build()
+type SettingsBuilder struct {
+	settings *Settings
+}
+
+// NewTestSettings creates a new SettingsBuilder initialized with default test settings.
+func NewTestSettings() *SettingsBuilder {
+	return &SettingsBuilder{
+		settings: GetTestSettings(),
+	}
+}
+
+// WithBirdNET configures BirdNET-specific settings.
+func (b *SettingsBuilder) WithBirdNET(threshold, latitude, longitude float64) *SettingsBuilder {
+	b.settings.BirdNET.Threshold = threshold
+	b.settings.BirdNET.Latitude = latitude
+	b.settings.BirdNET.Longitude = longitude
+	return b
+}
+
+// WithMQTT configures MQTT settings and enables MQTT.
+func (b *SettingsBuilder) WithMQTT(broker, topic string) *SettingsBuilder {
+	b.settings.Realtime.MQTT.Enabled = true
+	b.settings.Realtime.MQTT.Broker = broker
+	b.settings.Realtime.MQTT.Topic = topic
+	return b
+}
+
+// WithAudioExport configures audio export settings and enables audio export.
+func (b *SettingsBuilder) WithAudioExport(path, exportType, bitrate string) *SettingsBuilder {
+	b.settings.Realtime.Audio.Export.Enabled = true
+	b.settings.Realtime.Audio.Export.Path = path
+	b.settings.Realtime.Audio.Export.Type = exportType
+	b.settings.Realtime.Audio.Export.Bitrate = bitrate
+	return b
+}
+
+// WithSpeciesTracking configures species tracking settings and enables species tracking.
+func (b *SettingsBuilder) WithSpeciesTracking(windowDays, syncInterval int) *SettingsBuilder {
+	b.settings.Realtime.SpeciesTracking.Enabled = true
+	b.settings.Realtime.SpeciesTracking.NewSpeciesWindowDays = windowDays
+	b.settings.Realtime.SpeciesTracking.SyncIntervalMinutes = syncInterval
+	return b
+}
+
+// WithRTSPHealthThreshold configures RTSP health monitoring threshold.
+func (b *SettingsBuilder) WithRTSPHealthThreshold(seconds int) *SettingsBuilder {
+	b.settings.Realtime.RTSP.Health.HealthyDataThreshold = seconds
+	return b
+}
+
+// WithImageProvider configures thumbnail image provider settings.
+func (b *SettingsBuilder) WithImageProvider(provider, fallbackPolicy string) *SettingsBuilder {
+	b.settings.Realtime.Dashboard.Thumbnails.ImageProvider = provider
+	b.settings.Realtime.Dashboard.Thumbnails.FallbackPolicy = fallbackPolicy
+	return b
+}
+
+// WithSecurity configures security settings.
+func (b *SettingsBuilder) WithSecurity(host string, autoTLS bool) *SettingsBuilder {
+	b.settings.Security.Host = host
+	b.settings.Security.AutoTLS = autoTLS
+	return b
+}
+
+// WithWebServer configures web server settings.
+func (b *SettingsBuilder) WithWebServer(port string, enabled bool) *SettingsBuilder {
+	b.settings.WebServer.Port = port
+	b.settings.WebServer.Enabled = enabled
+	return b
+}
+
+// Build returns the constructed settings without modifying global state.
+// Use this when you need the settings object for manual manipulation.
+func (b *SettingsBuilder) Build() *Settings {
+	return b.settings
+}
+
+// Apply sets the built settings as the global test settings.
+// This is equivalent to calling SetTestSettings() with the built settings.
+func (b *SettingsBuilder) Apply() *Settings {
+	SetTestSettings(b.settings)
+	return b.settings
 }
 
 // Note: SendValidationWarningsAsNotifications function removed as it was unused

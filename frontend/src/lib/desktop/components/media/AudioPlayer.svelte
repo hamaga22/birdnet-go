@@ -37,6 +37,14 @@
 
   const logger = loggers.audio;
 
+  // Debug logging helper - bypasses linter warnings when debug flag is enabled
+  const debugLog = (message: string, data?: unknown) => {
+    if (debug) {
+      // eslint-disable-next-line no-console
+      console.log(`[AudioPlayer:${detectionId}] ${message}`, data || '');
+    }
+  };
+
   // Web Audio API types - these are built-in browser types
   /* global AudioContext, MediaElementAudioSourceNode, GainNode, DynamicsCompressorNode, BiquadFilterNode, EventListener, ResizeObserver */
 
@@ -60,6 +68,8 @@
     onPlayStart?: () => void;
     /** Fired 3 seconds after audio stops - resumes detection updates */
     onPlayEnd?: () => void;
+    /** Enable debug logging for troubleshooting multi-session issues */
+    debug?: boolean;
   }
 
   let {
@@ -75,6 +85,7 @@
     spectrogramRaw = false,
     onPlayStart,
     onPlayEnd,
+    debug = false,
   }: Props = $props();
 
   // Audio and UI elements
@@ -82,6 +93,8 @@
   let playerContainer: HTMLDivElement;
   let playPauseButton!: HTMLButtonElement; // Template-only binding
   let progressBar: HTMLDivElement;
+  // svelte-ignore non_reactive_update
+  let spectrogramImage: HTMLImageElement; // Template-only binding
   // svelte-ignore non_reactive_update
   let volumeControl!: HTMLDivElement; // Template-only binding
   // svelte-ignore non_reactive_update
@@ -130,6 +143,16 @@
   let statusPollTimer: ReturnType<typeof setTimeout> | undefined;
   let statusPollStartTime: number | undefined;
   let statusPollAbortController: AbortController | undefined;
+
+  // User-requested spectrogram generation state
+  // TODO: Wire up UI components for generate button when spectrogramNeedsGeneration is true
+  // eslint-disable-next-line no-unused-vars
+  let spectrogramNeedsGeneration = $state(false);
+  let isGeneratingSpectrogram = $state(false);
+  // eslint-disable-next-line no-unused-vars
+  let generationError = $state<string | null>(null);
+  // Default to "auto" mode if backend doesn't specify
+  let spectrogramMode = $state<string>('auto');
 
   // Audio processing state
   let audioContext: AudioContext | null = null;
@@ -385,14 +408,78 @@
     updateFilter(newFreq);
   };
 
+  // Check spectrogram mode on mount/URL change to avoid double-request pattern
+  // NOTE: Current implementation requires an initial network request to detect mode.
+  //
+  // Future optimization options:
+  // 1. Read from global settings store (if spectrogram mode is exposed frontend-wide)
+  // 2. Call dedicated /api/v2/spectrogram/:id/info endpoint for lightweight metadata
+  // 3. Use format query parameter (e.g., ?format=json) for explicit JSON responses
+  //
+  // The current approach is acceptable as it eliminates the previous double-request
+  // pattern where BOTH the <img> load AND a subsequent fetch() would fail before
+  // showing the generate button.
+  const checkSpectrogramMode = async () => {
+    if (!spectrogramUrl) {
+      spectrogramMode = 'auto';
+      debugLog('checkSpectrogramMode: no spectrogramUrl');
+      return;
+    }
+
+    debugLog('checkSpectrogramMode: fetching', { url: spectrogramUrl });
+    try {
+      const response = await fetch(spectrogramUrl);
+      debugLog('checkSpectrogramMode: response', {
+        status: response.status,
+        contentType: response.headers.get('Content-Type'),
+      });
+
+      if (response.status === 404) {
+        const contentType = response.headers.get('Content-Type');
+        if (contentType?.includes('application/json')) {
+          const responseData = await response.json();
+          // Extract mode from data field in API v2 envelope, default to "auto" if not specified
+          spectrogramMode = responseData.data?.mode ?? 'auto';
+
+          debugLog('checkSpectrogramMode: mode detected', { mode: spectrogramMode });
+
+          if (spectrogramMode === 'user-requested') {
+            logger.debug('Spectrogram in user-requested mode', { detectionId });
+            spectrogramNeedsGeneration = true;
+            spectrogramLoader.setLoading(false);
+          }
+        }
+      } else if (response.ok) {
+        // Spectrogram exists - mode is no longer relevant
+        spectrogramMode = 'auto';
+        spectrogramNeedsGeneration = false;
+        debugLog('checkSpectrogramMode: spectrogram exists');
+      }
+    } catch (err) {
+      logger.debug('Failed to check spectrogram mode', { detectionId, error: err });
+      debugLog('checkSpectrogramMode: error', err);
+      // Default to auto mode on error
+      spectrogramMode = 'auto';
+    }
+  };
+
   // Poll spectrogram generation status
   const pollSpectrogramStatus = async () => {
-    if (!showSpectrogram || !detectionId) return;
+    if (!showSpectrogram || !detectionId) {
+      debugLog('pollSpectrogramStatus: skipped', {
+        showSpectrogram,
+        detectionId,
+      });
+      return;
+    }
 
     // Check if we've exceeded max polling duration
     if (statusPollStartTime && Date.now() - statusPollStartTime > MAX_POLL_DURATION) {
       logger.warn('Spectrogram polling timeout exceeded', {
         detectionId,
+        pollDurationMs: Date.now() - statusPollStartTime,
+      });
+      debugLog('pollSpectrogramStatus: timeout exceeded', {
         pollDurationMs: Date.now() - statusPollStartTime,
       });
       clearStatusPollTimer();
@@ -403,15 +490,28 @@
     // Create new AbortController for this poll request
     statusPollAbortController = new AbortController();
 
+    const statusUrl = `/api/v2/spectrogram/${detectionId}/status?size=${spectrogramSize}${spectrogramRaw ? '&raw=true' : ''}`;
+    debugLog('pollSpectrogramStatus: fetching', { url: statusUrl });
+
     try {
-      const response = await fetch(
-        `/api/v2/spectrogram/${detectionId}/status?size=${spectrogramSize}${spectrogramRaw ? '&raw=true' : ''}`,
-        { signal: statusPollAbortController.signal }
-      );
+      const response = await fetch(statusUrl, { signal: statusPollAbortController.signal });
+
+      debugLog('pollSpectrogramStatus: response', {
+        ok: response.ok,
+        status: response.status,
+      });
 
       if (response.ok) {
-        const status = await response.json();
+        const responseData = await response.json();
+        // Extract status from v2 envelope format
+        const status = responseData.data ?? responseData;
         spectrogramStatus = status;
+
+        debugLog('pollSpectrogramStatus: status data', {
+          status: status.status,
+          queuePosition: status.queuePosition,
+          message: status.message,
+        });
 
         // Check status and decide what to do
         if (
@@ -420,21 +520,24 @@
           status.status === 'generated'
         ) {
           // Spectrogram is ready, stop polling and try to load it
+          debugLog('pollSpectrogramStatus: spectrogram ready, reloading image');
           clearStatusPollTimer();
           spectrogramStatus = null;
-          // Force reload the image
-          const img = document.querySelector(`#spectrogram-${detectionId}`) as HTMLImageElement;
-          if (img && spectrogramUrl) {
+          // Force reload the image using Svelte binding
+          if (spectrogramImage && spectrogramUrl) {
             const url = new URL(spectrogramUrl, window.location.origin);
             url.searchParams.set('t', Date.now().toString());
-            img.src = url.toString();
+            spectrogramImage.src = url.toString();
+            debugLog('pollSpectrogramStatus: image src updated', { src: url.toString() });
           }
         } else if (status.status === 'queued' || status.status === 'generating') {
           // Still processing, continue polling
+          debugLog('pollSpectrogramStatus: still processing, scheduling next poll');
           clearStatusPollTimer();
           statusPollTimer = setTimeout(pollSpectrogramStatus, SPECTROGRAM_POLL_INTERVAL);
         } else if (status.status === 'failed') {
           // Generation failed
+          debugLog('pollSpectrogramStatus: generation failed');
           clearStatusPollTimer();
           spectrogramLoader.setError();
         }
@@ -443,9 +546,11 @@
       // Ignore abort errors
       if (err instanceof Error && err.name === 'AbortError') {
         logger.debug('Spectrogram status poll aborted', { detectionId });
+        debugLog('pollSpectrogramStatus: aborted');
         return;
       }
       logger.error('Failed to poll spectrogram status', { detectionId, error: err });
+      debugLog('pollSpectrogramStatus: error', err);
     }
   };
 
@@ -463,17 +568,39 @@
 
   // Spectrogram loading handlers
   const handleSpectrogramLoad = () => {
+    debugLog('handleSpectrogramLoad: success');
     spectrogramLoader.setLoading(false);
     spectrogramRetryCount = 0; // Reset retry count on successful load
     clearSpectrogramRetryTimer();
     clearStatusPollTimer(); // Also clear status polling
   };
 
-  const handleSpectrogramError = (event: Event) => {
+  const handleSpectrogramError = async (event: Event) => {
     const img = event.currentTarget as HTMLImageElement;
+
+    debugLog('handleSpectrogramError: triggered', {
+      retryCount: spectrogramRetryCount,
+      mode: spectrogramMode,
+      src: img.src,
+    });
+
+    // Check if this is user-requested mode (using cached mode)
+    if (spectrogramRetryCount === 0 && spectrogramMode === 'user-requested') {
+      // User-requested mode - show generate button instead of error
+      logger.debug('Spectrogram not generated in user-requested mode', {
+        detectionId,
+      });
+      debugLog('handleSpectrogramError: user-requested mode, showing generate button');
+      spectrogramNeedsGeneration = true;
+      spectrogramLoader.setLoading(false);
+      clearSpectrogramRetryTimer();
+      clearStatusPollTimer();
+      return;
+    }
 
     // Start polling for generation status on first error
     if (spectrogramRetryCount === 0) {
+      debugLog('handleSpectrogramError: first error, starting status polling');
       statusPollStartTime = Date.now();
       pollSpectrogramStatus();
     }
@@ -493,6 +620,12 @@
         status: spectrogramStatus?.status,
       });
 
+      debugLog('handleSpectrogramError: scheduling retry', {
+        retryCount: spectrogramRetryCount + 1,
+        retryDelay,
+        currentStatus: spectrogramStatus?.status,
+      });
+
       spectrogramRetryCount++;
 
       // Schedule retry
@@ -503,6 +636,7 @@
         url.searchParams.set('retry', spectrogramRetryCount.toString());
         url.searchParams.set('t', Date.now().toString());
         img.src = url.toString();
+        debugLog('handleSpectrogramError: retry attempted', { newSrc: url.toString() });
       }, retryDelay);
 
       return; // Don't set error state yet
@@ -515,11 +649,16 @@
         status: spectrogramStatus.status,
         queuePosition: spectrogramStatus.queuePosition,
       });
+      debugLog('handleSpectrogramError: max retries but still generating, keep polling', {
+        status: spectrogramStatus.status,
+        queuePosition: spectrogramStatus.queuePosition,
+      });
       // Don't set error, keep polling
       return;
     }
 
     // Really failed - stop everything
+    debugLog('handleSpectrogramError: giving up after max retries');
     spectrogramLoader.setError();
     clearSpectrogramRetryTimer();
     clearStatusPollTimer();
@@ -537,6 +676,108 @@
     }
   };
 
+  // Handle user-requested spectrogram generation
+  // TODO: Wire up to generate button in UI when spectrogramNeedsGeneration is true
+  // eslint-disable-next-line no-unused-vars
+  const handleGenerateSpectrogram = async () => {
+    if (isGeneratingSpectrogram) {
+      debugLog('handleGenerateSpectrogram: already generating, skipping');
+      return; // Prevent double-click
+    }
+
+    isGeneratingSpectrogram = true;
+    generationError = null;
+
+    logger.info('User requested spectrogram generation', { detectionId });
+    debugLog('handleGenerateSpectrogram: starting generation');
+
+    try {
+      // Build POST URL using URL and URLSearchParams
+      const generateUrl = new URL(
+        `/api/v2/spectrogram/${detectionId}/generate`,
+        window.location.origin
+      );
+      const params = new URLSearchParams();
+      params.set('size', spectrogramSize);
+      if (spectrogramRaw) {
+        params.set('raw', 'true');
+      }
+      generateUrl.search = params.toString();
+
+      debugLog('handleGenerateSpectrogram: POST request', { url: generateUrl.toString() });
+
+      const response = await fetch(generateUrl.toString(), {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      });
+
+      debugLog('handleGenerateSpectrogram: response', { status: response.status });
+
+      // Handle both 200 (immediate generation) and 202 (async generation)
+      if (response.status === 202) {
+        // Async generation - API returns 202 Accepted
+        logger.info('Spectrogram generation queued', { detectionId });
+        debugLog('handleGenerateSpectrogram: queued (202), starting polling');
+
+        // Reset state and start polling
+        spectrogramNeedsGeneration = false;
+        spectrogramRetryCount = 0;
+        spectrogramLoader.setLoading(true);
+        statusPollStartTime = Date.now();
+
+        // Start polling for status
+        pollSpectrogramStatus();
+      } else if (response.ok) {
+        // Immediate generation (backward compatibility for old API)
+        const responseData = await response.json();
+        const data = responseData.data ?? responseData;
+        logger.info('Spectrogram generated successfully', {
+          detectionId,
+          path: data.path,
+        });
+        debugLog('handleGenerateSpectrogram: immediate success', { path: data.path });
+
+        // Reset state and reload the spectrogram
+        spectrogramNeedsGeneration = false;
+        spectrogramRetryCount = 0;
+        spectrogramLoader.setLoading(true);
+
+        // Reload the image with cache-busting parameter
+        if (spectrogramImage && spectrogramUrl) {
+          const url = new URL(spectrogramUrl, window.location.origin);
+          url.searchParams.set('t', Date.now().toString());
+          spectrogramImage.src = url.toString();
+          debugLog('handleGenerateSpectrogram: reloading image', { src: url.toString() });
+        }
+      } else {
+        // Error response
+        let errorMessage = `Generation failed with status ${response.status}`;
+        try {
+          const errorData = await response.json();
+          errorMessage = errorData.message ?? errorMessage;
+        } catch (parseErr) {
+          logger.warn('Failed to parse error response', { parseErr });
+        }
+        debugLog('handleGenerateSpectrogram: error response', { errorMessage });
+        throw new Error(errorMessage);
+      }
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : 'Failed to generate spectrogram';
+      generationError = errorMessage;
+      logger.error('Spectrogram generation failed', {
+        detectionId,
+        error: err,
+      });
+      debugLog('handleGenerateSpectrogram: exception', err);
+      spectrogramLoader.setError();
+    } finally {
+      isGeneratingSpectrogram = false;
+      debugLog('handleGenerateSpectrogram: completed');
+    }
+  };
+
   // Track previous URL to avoid unnecessary resets
   let previousSpectrogramUrl = $state<string | null>(null);
 
@@ -544,7 +785,13 @@
   $effect(() => {
     // Only reset loading state if URL actually changed
     if (spectrogramUrl && spectrogramUrl !== previousSpectrogramUrl && !spectrogramLoader.error) {
+      debugLog('$effect: spectrogramUrl changed', {
+        from: previousSpectrogramUrl,
+        to: spectrogramUrl,
+      });
       previousSpectrogramUrl = spectrogramUrl;
+      // Check mode first to avoid double-request pattern
+      checkSpectrogramMode();
       // Start loading when URL changes
       spectrogramLoader.setLoading(true);
       // Reset retry count and clear any pending retry timer for new spectrogram
@@ -557,6 +804,12 @@
 
   // Lifecycle
   onMount(() => {
+    debugLog('onMount: component mounted', {
+      audioUrl,
+      spectrogramUrl,
+      showSpectrogram,
+    });
+
     // Check if mobile
     isMobile = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
 
@@ -639,7 +892,33 @@
     };
   });
 
+  // Debug effect to track spectrogram loader state changes
+  $effect(() => {
+    debugLog('loader state changed', {
+      loading: spectrogramLoader.loading,
+      showSpinner: spectrogramLoader.showSpinner,
+      error: spectrogramLoader.error,
+    });
+  });
+
+  // Debug effect to track spectrogram status changes
+  $effect(() => {
+    if (spectrogramStatus) {
+      debugLog('spectrogram status changed', {
+        status: spectrogramStatus.status,
+        queuePosition: spectrogramStatus.queuePosition,
+        message: spectrogramStatus.message,
+      });
+    }
+  });
+
   onDestroy(() => {
+    debugLog('onDestroy: component destroying', {
+      isPlaying,
+      spectrogramRetryCount,
+      hasStatusPollTimer: !!statusPollTimer,
+    });
+
     // Stop any running intervals
     stopInterval();
 
@@ -761,6 +1040,7 @@
       </div>
     {:else}
       <img
+        bind:this={spectrogramImage}
         id={`spectrogram-${detectionId}`}
         src={spectrogramUrl}
         alt="Audio spectrogram"

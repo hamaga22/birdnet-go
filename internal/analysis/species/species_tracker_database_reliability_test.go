@@ -14,6 +14,7 @@ import (
 
 	"github.com/tphakala/birdnet-go/internal/conf"
 	"github.com/tphakala/birdnet-go/internal/datastore"
+	"github.com/tphakala/birdnet-go/internal/datastore/mocks"
 )
 
 // TestLoadLifetimeDataFromDatabase_CriticalReliability tests the core data loading function
@@ -105,18 +106,22 @@ func TestLoadLifetimeDataFromDatabase_CriticalReliability(t *testing.T) {
 			t.Logf("Testing critical scenario: %s", tt.description)
 
 			// Create mock datastore
-			ds := &MockSpeciesDatastore{}
+			ds := mocks.NewMockInterface(t)
 			if tt.mockError != nil {
-				ds.On("GetNewSpeciesDetections", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-					Return(nil, tt.mockError)
+				ds.On("GetNewSpeciesDetections", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+					Return(nil, tt.mockError).Maybe()
 			} else {
-				ds.On("GetNewSpeciesDetections", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-					Return(tt.mockData, nil)
+				ds.On("GetNewSpeciesDetections", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+					Return(tt.mockData, nil).Maybe()
 			}
 
-			// Mock other required methods
-			ds.On("GetSpeciesFirstDetectionInPeriod", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-				Return([]datastore.NewSpeciesData{}, nil)
+			// BG-17: InitFromDatabase requires notification history (optional)
+			ds.On("GetActiveNotificationHistory", mock.AnythingOfType("time.Time")).
+				Return([]datastore.NotificationHistory{}, nil).Maybe()
+
+			// Mock other required methods (optional based on settings)
+			ds.On("GetSpeciesFirstDetectionInPeriod", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+				Return([]datastore.NewSpeciesData{}, nil).Maybe()
 
 			// Create tracker
 			settings := &conf.SpeciesTrackingSettings{
@@ -241,16 +246,19 @@ func TestLoadYearlyDataFromDatabase_CriticalReliability(t *testing.T) {
 			t.Logf("Testing yearly data loading: %s", tt.description)
 
 			// Create mock datastore
-			ds := &MockSpeciesDatastore{}
-			ds.On("GetNewSpeciesDetections", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-				Return([]datastore.NewSpeciesData{}, nil) // Lifetime data
+			ds := mocks.NewMockInterface(t)
+			ds.On("GetNewSpeciesDetections", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+				Return([]datastore.NewSpeciesData{}, nil).Maybe()
+			// BG-17: InitFromDatabase now loads notification history
+			ds.On("GetActiveNotificationHistory", mock.AnythingOfType("time.Time")).
+				Return([]datastore.NotificationHistory{}, nil).Maybe() // Lifetime data
 
 			if tt.mockError != nil {
-				ds.On("GetSpeciesFirstDetectionInPeriod", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-					Return(nil, tt.mockError)
+				ds.On("GetSpeciesFirstDetectionInPeriod", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+					Return(nil, tt.mockError).Maybe()
 			} else {
-				ds.On("GetSpeciesFirstDetectionInPeriod", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-					Return(tt.mockData, nil)
+				ds.On("GetSpeciesFirstDetectionInPeriod", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+					Return(tt.mockData, nil).Maybe()
 			}
 
 			// Create tracker with yearly tracking enabled
@@ -372,7 +380,7 @@ func TestSyncIfNeeded_CriticalReliability(t *testing.T) {
 			t.Logf("Testing sync scenario: %s", tt.description)
 
 			// Create mock datastore
-			ds := &MockSpeciesDatastore{}
+			ds := mocks.NewMockInterface(t)
 
 			// Setup mock data for initial load and sync calls with recent dates
 			recentDate := time.Now().AddDate(0, 0, -5).Format("2006-01-02")      // 5 days ago
@@ -401,21 +409,25 @@ func TestSyncIfNeeded_CriticalReliability(t *testing.T) {
 			}
 
 			// First call for InitFromDatabase (during tracker creation)
-			ds.On("GetNewSpeciesDetections", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+			ds.On("GetNewSpeciesDetections", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
 				Return(initialData, nil).Once()
 
 			// Subsequent calls for sync
 			if tt.expectSync && syncError != nil {
-				ds.On("GetNewSpeciesDetections", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+				ds.On("GetNewSpeciesDetections", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
 					Return(nil, syncError).Once()
 			} else if tt.expectSync {
-				ds.On("GetNewSpeciesDetections", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+				ds.On("GetNewSpeciesDetections", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
 					Return(syncData, nil).Once()
 			}
 
-			// Always setup for period data calls
-			ds.On("GetSpeciesFirstDetectionInPeriod", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-				Return([]datastore.NewSpeciesData{}, nil)
+			// BG-17: InitFromDatabase requires notification history (optional)
+			ds.On("GetActiveNotificationHistory", mock.AnythingOfType("time.Time")).
+				Return([]datastore.NotificationHistory{}, nil).Maybe()
+
+			// Always setup for period data calls (optional based on settings)
+			ds.On("GetSpeciesFirstDetectionInPeriod", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+				Return([]datastore.NewSpeciesData{}, nil).Maybe()
 
 			// Create tracker
 			settings := &conf.SpeciesTrackingSettings{
@@ -469,7 +481,7 @@ func generateLargeDataset(count int) []datastore.NewSpeciesData {
 	// Use current time minus a few days to ensure data is recent
 	baseDate := time.Now().AddDate(0, 0, -10) // 10 days ago
 
-	for i := 0; i < count; i++ {
+	for i := range count {
 		// Generate species name and date
 		speciesName := fmt.Sprintf("Large_Dataset_Species_%06d", i)
 		// Spread across 10 days instead of full year to keep all data recent
