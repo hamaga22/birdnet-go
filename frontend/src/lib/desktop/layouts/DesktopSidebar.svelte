@@ -169,23 +169,23 @@ Performance Optimizations:
     class="flex flex-col h-[100dvh] w-64 bg-base-100 absolute inset-y-0 sm:static sm:h-full overflow-y-auto p-4"
   >
     <!-- Header -->
-    <div class="flex-none p-4">
+    <div class="flex-none">
       <button
         onclick={() => navigate(navigationUrls.dashboard)}
-        class="flex items-center gap-2 font-black text-2xl"
-        aria-label="BirdNET-Mark Home"
+        class="flex items-center gap-2 w-full"
+        aria-label="MarkNET"
       >
-        BirdNET-Mark
         <img
           src="/assets/images/mark-circle.png"
           alt="BirdNET-Mark Logo"
-          class="absolute h-10 w-10 right-5 mr-2"
+          class="h-10 w-10 flex-shrink-0"
         />
+        <span class="font-black text-2xl truncate min-w-0">MarkNET</span>
       </button>
     </div>
 
     <!-- Scrollable menu section -->
-    <div class="flex-1 overflow-y-auto px-4">
+    <div class="flex-1 overflow-y-auto">
       <ul class="menu menu-md" role="menubar">
         <li role="none">
           <button
