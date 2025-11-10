@@ -38,7 +38,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
+          go-version: "1.25"
           check-latest: true
 
       - name: Install Linux system dependencies
@@ -56,9 +56,9 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '24'
-          cache: 'npm'
-          cache-dependency-path: 'frontend/package-lock.json'
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: "frontend/package-lock.json"
 
       - name: Get Build Version
         id: get_build_version
@@ -85,16 +85,16 @@ jobs:
         run: |
           # Create artifacts directory
           mkdir -p artifacts
-          
+
           # Set binary name based on OS
           BINARY_NAME=birdnet-go
           if [ "${{ matrix.goos }}" = "windows" ]; then
             BINARY_NAME=birdnet-go.exe
           fi
-          
+
           # Copy binary
           cp bin/$BINARY_NAME artifacts/
-          
+
           # Copy required library files based on OS and architecture
           if [ "${{ matrix.goos }}" = "linux" ]; then
             if [ "${{ matrix.goarch }}" = "amd64" ]; then
@@ -107,7 +107,7 @@ jobs:
           elif [ "${{ matrix.goos }}" = "darwin" ]; then
             cp /opt/homebrew/lib/libtensorflowlite_c.dylib artifacts/
           fi
-          
+
           # Create tarball
           cd artifacts
           tar czf ../birdnet-go-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz *
@@ -167,7 +167,7 @@ jobs:
       create-latest-tag: false
       platforms: '["linux/amd64", "linux/arm64"]'
       push-to-ghcr: true
-      push-to-dockerhub: true
+      push-to-dockerhub: false
       cleanup-old-images: true
       keep-images-count: 14
     secrets: inherit
