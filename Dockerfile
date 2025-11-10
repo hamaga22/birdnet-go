@@ -24,10 +24,17 @@ RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - && \
 # Install Task
 RUN sh -c "$(curl --location https://taskfile.dev/install.sh)" -- -d -b /usr/local/bin
 
-# Install XNNPACK?
-RUN apt-get update -q && apt-get install -q -y \
-    libxnnpack-dev \
+# # Install XNNPACK?
+# RUN apt-get update -q && apt-get install -q -y \
+#     libxnnpack-dev \
+#     && rm -rf /var/lib/apt/lists/*
+
+# Add arm64 architecture for cross-compiling and install arm64 XNNPACK
+RUN dpkg --add-architecture arm64 && \
+    apt-get update -q && apt-get install -q -y \
+    libxnnpack-dev:arm64 \
     && rm -rf /var/lib/apt/lists/*
+
 
 # Create dev-user for building and devcontainer usage
 RUN groupadd --gid 10001 dev-user && \
