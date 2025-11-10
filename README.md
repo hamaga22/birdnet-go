@@ -1,4 +1,4 @@
-# BirdNET-Mark
+# MarkNET-Go
 
 <p align="center">
   <img src="assets/images/mark-circle.png" />
