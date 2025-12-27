@@ -384,7 +384,7 @@ Source: MIT
 
 ### github.com/tphakala/go-tflite
 
-License: https://github.com/tphakala/go-tflite/blob/2dad4328ec9e/LICENSE
+License: https://github.com/tphakala/go-tflite/blob/v0.1.1/LICENSE
 Source: MIT
 
 ### github.com/tphakala/malgo
